@@ -93,43 +93,58 @@ GITLAB_REMOTE_STATE_ADDRESS=your_gitlab_remote_state_url
 
 ### 実行方法
 
-1. Docker Compose で Terraform コンテナを起動：
+1. Discord
+   1. サーバーを新規作成します。
+   2. 作成したサーバーのIDを取得してください。
+       - [ユーザー/サーバー/メッセージIDはどこで見つけられる？｜Discord Support](https://support.discord.com/hc/ja/articles/206346498-%E3%83%A6%E3%83%BC%E3%82%B6%E3%83%BC-%E3%82%B5%E3%83%BC%E3%83%90%E3%83%BC-%E3%83%A1%E3%83%83%E3%82%BB%E3%83%BC%E3%82%B8ID%E3%81%AF%E3%81%A9%E3%81%93%E3%81%A7%E8%A6%8B%E3%81%A4%E3%81%91%E3%82%89%E3%82%8C%E3%82%8B)を参考にサーバーIDを取得して下さい。
+       - 取得したサーバーのIDは、`.env`ファイルに設定してください。
 
-```bash
-docker-compose up -d
-```
+2. Discord Developer Portal
+   1. アプリケーションを作成します。アプリケーション名はサーバー内のユーザーに表示されます。
+   2. アプリケーションの設定を開き、Bot設定からBot Tokenを取得して下さい。
+       - 取得したBot Tokenは、`.env`ファイルに設定してください。
+   3. Privileged Gateway Intentsを有効化してください。
+   4. OAuth2 URL Generatorより、サーバーに追加するためのURLを取得してください。
+       - SCOPES: bot
+       - BOT PERMISSIONS: Administrator
+   5. 取得したURLへアクセスして、アプリケーションをサーバーに追加して下さい。
 
-2. コンテナに入る：
+3. (BackendをGitLab Terraform Stateにする場合) GitLab
+   1. GitLab Personal Access Tokenを取得してください。
+       - 取得したPersonal Access Tokenは、`.env`ファイルに設定してください。
+   2. GitLab Terraform StateのURLを取得してください。
+       - 取得したURLは、`.env`ファイルに設定してください。
+       - URLは、`https://[gitlab_domain]/api/v4/projects/[project_id]/terraform/state`の形式です。
 
-```bash
-docker-compose exec terraform sh
-```
+4. Terraform
 
-3. Terraform を初期化：
+   1. Docker上でTerraformコンテナを起動し、Terraformを実行します。
 
-```bash
-# サーバー設定
-cd services/discord/environments/pro/server
-terraform init
+       （使用しているTerraform Providerがx86_64のみ対応しているため、Apple SiliconではDockerを使用して実行する必要があります。）
 
-# チャンネル設定
-cd ../channels
-terraform init
-```
+        ```bash
+        docker compose run --rm terraform
+        ```
 
-4. 設定を適用：
+   2. Terraform Initを行います。
 
-```bash
-# サーバー設定を先に適用
-cd services/discord/environments/pro/server
-terraform plan
-terraform apply
+        GitLab Terraform Stateを使用している場合は、GitLabの画面表示に従って下さい。
 
-# その後チャンネル設定を適用
-cd ../channels
-terraform plan
-terraform apply
-```
+   3. 設定を適用：
+
+        ```bash
+        # サーバー設定を先に適用
+        cd services/discord/environments/pro/server
+        terraform plan
+        terraform apply
+
+        # 既に存在するチャンネルを使用する場合には`terraform import`を使用して下さい。
+
+        # その後チャンネル設定を適用
+        cd ../channels
+        terraform plan
+        terraform apply
+        ```
 
 ## 使用上の注意
 
