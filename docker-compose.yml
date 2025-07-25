@@ -1,0 +1,12 @@
+services:
+  terraform:
+    image: hashicorp/terraform
+    platform: linux/amd64
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    working_dir: /app
+    tty: true
+    stdin_open: true
+    entrypoint: /bin/sh
