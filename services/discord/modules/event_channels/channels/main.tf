@@ -41,7 +41,7 @@ resource "discord_text_channel" "document" {
   position = 4
 }
 
-resource "discord_text_channel" "gitlab" {
+resource "discord_text_channel" "webhook" {
   server_id = var.server.id
   name = "🔔｜webhook"
   category = discord_category_channel.main.id
