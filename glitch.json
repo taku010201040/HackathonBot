@@ -1,0 +1,4 @@
+{
+  "install": "pip3 install --user -r services/bot/requirements.txt",
+  "start": "PYTHONUNBUFFERED=1 python3 services/bot/main.py"
+}
