@@ -45,3 +45,18 @@ terraform.rc
 
 # Environment variables
 .env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+
+# Terraform binaries & zip
+terraform.exe
+terraform.zip

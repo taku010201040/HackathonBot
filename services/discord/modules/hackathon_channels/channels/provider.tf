@@ -5,8 +5,4 @@ terraform {
       version = "2.1.0"
     }
   }
-
-  backend "local" {
-    path = "terraform.tfstate"
-  }
 }

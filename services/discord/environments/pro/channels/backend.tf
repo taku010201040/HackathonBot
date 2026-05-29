@@ -6,7 +6,8 @@ terraform {
     }
   }
 
-  backend "http" {
+  backend "local" {
+    path = "terraform.tfstate"
   }
 }
 
@@ -15,11 +16,9 @@ terraform {
 ################################
 
 data "terraform_remote_state" "server" {
-  backend = "http"
+  backend = "local"
   
   config = {
-    address = "${var.gitlab_remote_state_address}/hackathon-discord-server"
-    username = var.gitlab_username
-    password = var.gitlab_access_token
+    path = "../server/terraform.tfstate"
   }
 }
