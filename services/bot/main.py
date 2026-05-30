@@ -5,6 +5,52 @@ import os
 from dotenv import load_dotenv
 import threading
 from http.server import SimpleHTTPRequestHandler, HTTPServer
+from deep_translator import GoogleTranslator
+
+import sqlite3
+import datetime
+from discord.ext import tasks
+import google.generativeai as genai
+import asyncio
+
+DB_PATH = "bot_data.db"
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, xp INTEGER DEFAULT 0, level INTEGER DEFAULT 1)')
+    c.execute('CREATE TABLE IF NOT EXISTS knowledge (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT)')
+    c.execute('CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id INTEGER, send_at TEXT, message TEXT)')
+    c.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
+    conn.commit()
+    conn.close()
+init_db()
+
+try:
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY", ""))
+    generation_config = {"temperature": 0.2}
+except:
+    pass
+
+def get_knowledge_context():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT content FROM knowledge')
+    rows = c.fetchall()
+    conn.close()
+    return "\n---\n".join([r[0] for r in rows])
+
+async def ask_gemini(prompt: str) -> str:
+    if not os.getenv("GEMINI_API_KEY"):
+        return "Gemini APIキーが設定されていません。"
+    context = get_knowledge_context()
+    system_instruction = f"あなたはハッカソンのサポートAIです。以下のナレッジを参考にして回答してください。\n【ナレッジ】\n{context}"
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=system_instruction, generation_config=generation_config)
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"AIエラー: {e}"
+
 
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '..', '.env'))
 
@@ -42,6 +88,29 @@ class RoleDropdown(discord.ui.Select):
             
         # deferしているため、followup.send を使って完了を通知
         await interaction.followup.send(msg, ephemeral=True)
+
+
+class MentorAcceptView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        
+    @discord.ui.button(label="対応する", style=discord.ButtonStyle.success, custom_id="mentor_accept")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(f"{interaction.user.mention} メンターが対応を開始しました！", ephemeral=False)
+        button.disabled = True
+        button.label = f"{interaction.user.display_name}さんが対応中"
+        await interaction.message.edit(view=self)
+
+class MentorSummonView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        
+    @discord.ui.button(label="🆘 メンターを呼ぶ", style=discord.ButtonStyle.danger, custom_id="mentor_summon")
+    async def summon(self, interaction: discord.Interaction, button: discord.ui.Button):
+        mentor_role = discord.utils.get(interaction.guild.roles, name="メンター")
+        m = mentor_role.mention if mentor_role else "メンターの皆さん"
+        await interaction.channel.send(f"{m} {interaction.user.mention} さんがヘルプを求めています！", view=MentorAcceptView())
+        await interaction.response.send_message("メンターを呼び出しました。", ephemeral=True)
 
 class BasicProfileView(discord.ui.View):
     def __init__(self):
@@ -193,9 +262,67 @@ class MyClient(discord.Client):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
+    
+    @tasks.loop(minutes=60)
+    async def deadline_loop(self):
+        if not GUILD_ID: return
+        guild = self.get_guild(int(GUILD_ID))
+        if not guild: return
+        
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT value FROM settings WHERE key='deadline'")
+        row = c.fetchone()
+        conn.close()
+        
+        if row:
+            try:
+                deadline = datetime.datetime.fromisoformat(row[0])
+                now = datetime.datetime.now()
+                diff = deadline - now
+                hours = int(diff.total_seconds() // 3600)
+                
+                ch = discord.utils.find(lambda c: "⏳｜残り" in c.name, guild.voice_channels)
+                if hours >= 0:
+                    new_name = f"⏳｜残り {hours}時間"
+                else:
+                    new_name = "⏳｜ハッカソン終了！"
+                    
+                if ch and ch.name != new_name:
+                    await ch.edit(name=new_name)
+                elif not ch:
+                    # Create one at the top
+                    await guild.create_voice_channel(name=new_name, position=0)
+            except Exception as e:
+                print(f"Deadline loop error: {e}")
+
+    @tasks.loop(minutes=1)
+    async def schedule_loop(self):
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        c.execute("SELECT id, channel_id, message FROM schedules WHERE send_at <= ?", (now_str,))
+        rows = c.fetchall()
+        for r in rows:
+            sid, ch_id, msg = r
+            ch = self.get_channel(ch_id)
+            if ch:
+                try:
+                    await ch.send(msg)
+                except:
+                    pass
+            c.execute("DELETE FROM schedules WHERE id = ?", (sid,))
+        conn.commit()
+        conn.close()
+
     async def setup_hook(self):
         self.add_view(BasicProfileView())
         self.add_view(SkillsToolsView())
+        self.add_view(MentorSummonView())
+        self.add_view(MentorAcceptView())
+        self.deadline_loop.start()
+        self.schedule_loop.start()
+
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
             self.tree.copy_global_to(guild=guild)
@@ -233,15 +360,27 @@ TEMPLATES = {
 ※コピーしてアイデア共有チャンネルに貼り付けてください！"""
 }
 
-async def ensure_channel(guild: discord.Guild, name: str, category_keyword: str):
-    ch = discord.utils.get(guild.text_channels, name=name)
+async def ensure_channel(guild: discord.Guild, name: str, category_keyword: str, is_voice: bool = False):
+    if is_voice:
+        ch = discord.utils.get(guild.voice_channels, name=name)
+    else:
+        ch = discord.utils.get(guild.text_channels, name=name)
+        
     if ch:
         return ch
+        
     category = discord.utils.find(lambda c: category_keyword in c.name, guild.categories)
-    if category:
-        ch = await guild.create_text_channel(name=name, category=category)
+    
+    if is_voice:
+        if category:
+            ch = await guild.create_voice_channel(name=name, category=category)
+        else:
+            ch = await guild.create_voice_channel(name=name)
     else:
-        ch = await guild.create_text_channel(name=name)
+        if category:
+            ch = await guild.create_text_channel(name=name, category=category)
+        else:
+            ch = await guild.create_text_channel(name=name)
     return ch
 
 @client.tree.command(name="setup_onboarding", description="【運営用】案内チャンネルのメッセージを自動セットアップします")
@@ -251,25 +390,52 @@ async def setup_onboarding(interaction: discord.Interaction):
     guild = interaction.guild
     results = []
 
-    lounge_ch = discord.utils.find(lambda c: "雑談" in c.name, guild.text_channels)
-    if not lounge_ch:
-        lounge_ch = await ensure_channel(guild, "☕｜雑談ラウンジ", "COMMUNITY")
-        results.append("🆕 ☕｜雑談ラウンジ を作成しました")
-
-    sos_ch = discord.utils.find(lambda c: "SOS" in c.name or "sos" in c.name, guild.text_channels)
-    if not sos_ch:
-        sos_ch = await ensure_channel(guild, "🆘｜SOS窓口", "SUPPORT")
-        results.append("🆕 🆘｜SOS窓口 を作成しました")
-
-    rule_ch = discord.utils.find(lambda c: "ルール" in c.name or "ガイドライン" in c.name, guild.text_channels)
-    role_ch = discord.utils.find(lambda c: "ロール" in c.name or "付与" in c.name, guild.text_channels)
-    intro_ch = discord.utils.find(lambda c: "自己紹介" in c.name, guild.text_channels)
-    guide_ch = discord.utils.find(lambda c: "歩き方" in c.name or "ガイド" in c.name, guild.text_channels)
-    welcome_ch = discord.utils.find(lambda c: "ようこそ" in c.name, guild.text_channels)
-    question_ch = discord.utils.find(lambda c: "運営への質問" in c.name, guild.text_channels)
-
     def m(ch, fallback: str) -> str:
-        return ch.mention if ch else fallback
+        return ch.mention if ch else f"**{fallback}**"
+
+    # --- チャンネルの取得・作成 ---
+    lounge_ch = await ensure_channel(guild, "☕｜雑談ラウンジ", "COMMUNITY")
+    sos_ch = await ensure_channel(guild, "🆘｜SOS窓口", "SUPPORT")
+    rule_ch = await ensure_channel(guild, "📜｜ルール・ガイドライン", "WELCOME")
+    role_ch = await ensure_channel(guild, "✅｜ロール付与", "WELCOME")
+    intro_ch = await ensure_channel(guild, "👋｜自己紹介", "COMMUNITY")
+    guide_ch = await ensure_channel(guild, "🗺️｜歩き方ガイド", "WELCOME")
+    welcome_ch = await ensure_channel(guild, "🏁｜ようこそ", "WELCOME")
+    question_ch = await ensure_channel(guild, "❓｜運営への質問", "SUPPORT")
+
+    announce_ch = await ensure_channel(guild, "📢｜全体アナウンス", "ANNOUNCEMENTS")
+    calendar_ch = await ensure_channel(guild, "📅｜イベントカレンダー", "ANNOUNCEMENTS")
+    award_ch = await ensure_channel(guild, "🏆｜審査・アワード情報", "ANNOUNCEMENTS")
+    sponsor_info_ch = await ensure_channel(guild, "🎁｜協賛企業からのお知らせ", "ANNOUNCEMENTS")
+    
+    news_ai_ch = await ensure_channel(guild, "📰｜aiテックニュース", "COMMUNITY")
+    news_youth_ch = await ensure_channel(guild, "📰｜若手ニュース", "COMMUNITY")
+    resource_ch = await ensure_channel(guild, "📚｜リソース共有", "COMMUNITY")
+    photo_ch = await ensure_channel(guild, "📸｜写真・スクショ共有", "COMMUNITY")
+
+    recruit_ch = await ensure_channel(guild, "🤝｜メンバー募集", "TEAM BUILDING")
+    join_ch = await ensure_channel(guild, "🙋‍♀️｜チーム加入希望", "TEAM BUILDING")
+    idea_ch = await ensure_channel(guild, "💡｜アイデア共有・壁打ち", "TEAM BUILDING")
+    
+    mentor_intro_ch = await ensure_channel(guild, "👨‍🏫｜メンター紹介", "SPONSORS")
+    mentor_reserve_ch = await ensure_channel(guild, "🙋‍♂️｜メンタリング予約", "SPONSORS")
+    sponsor_booth_ch = await ensure_channel(guild, "🏢｜スポンサーブース", "SPONSORS")
+    
+    tech_ai_ch = await ensure_channel(guild, "🛠️｜技術サポート_ai", "SUPPORT")
+    tech_nocode_ch = await ensure_channel(guild, "🛠️｜技術サポート_ノーコード", "SUPPORT")
+    
+    # コミュニティアップデートチャンネル
+    community_updates_ch = await ensure_channel(guild, "📢｜コミュニティ・アップデート", "ANNOUNCEMENTS")
+
+    # 運営班用のテキスト＆VCチャンネル
+    planning_txt = await ensure_channel(guild, "📁｜企画進行", "運営")
+    planning_vc = await ensure_channel(guild, "🔊｜企画進行VC", "運営", is_voice=True)
+    pr_txt = await ensure_channel(guild, "📁｜広報", "運営")
+    pr_vc = await ensure_channel(guild, "🔊｜広報VC", "運営", is_voice=True)
+    ext_txt = await ensure_channel(guild, "📁｜外部連携", "運営")
+    ext_vc = await ensure_channel(guild, "🔊｜外部連携VC", "運営", is_voice=True)
+
+    results.append("✅ 必要な全チャンネルの存在確認・作成を完了しました")
 
     if welcome_ch:
         try:
@@ -305,227 +471,114 @@ async def setup_onboarding(interaction: discord.Interaction):
             ),
             color=0x00E676,
         )
-        embed2.set_footer(text=f"困ったことがあれば ❓運営への質問 チャンネルでいつでも聞いてください 🙌")
+        embed2.set_footer(text=f"困ったことがあれば {question_ch.name if question_ch else '運営への質問'} チャンネルでいつでも聞いてください 🙌")
 
         await welcome_ch.send(embeds=[embed1, embed2], silent=True)
-        results.append("✅ 🏁｜ようこそ")
-    else:
-        results.append("⚠️ 🏁｜ようこそ — チャンネルが見つかりません")
-
+    
     if rule_ch:
         try:
             await rule_ch.purge(limit=50)
-            results.append(f"🧹 {rule_ch.name} の過去メッセージを清掃しました")
-        except Exception as e:
-            results.append(f"⚠️ {rule_ch.name} の清掃に失敗しました: {e}")
+        except Exception:
+            pass
         rule_embed1 = discord.Embed(
             title="📜 サーバー利用ルール ＆ 行動規範（Code of Conduct）",
-            description=(
-                "本サーバーに参加された時点で、以下のルールに同意いただいたものとみなします。\n"
-                "全員が安心して開発に集中できる環境を、一緒に守っていきましょう。"
-            ),
+            description="本サーバーに参加された時点で、以下のルールに同意いただいたものとみなします。\n全員が安心して開発に集中できる環境を、一緒に守っていきましょう。",
             color=0xFF5252,
         )
         rule_embed1.add_field(name="\u200b", value="━━━━━━━━━━━━━━━━━━━━━━━━", inline=False)
         rule_embed1.add_field(
             name="🤝 1. 敬意あるコミュニケーション",
-            value=(
-                "\n"
-                "• すべての参加者・メンター・スポンサー・運営に対し、**敬意を持って**接してください。\n"
-                "• 人種・性別・年齢・宗教・性的指向・障がい・国籍に基づく差別的な発言は一切禁止です。\n"
-                "• 相手が不快に感じる行為は、たとえ「冗談」であっても**ハラスメント**に該当します。\n"
-                "• 建設的な批判は歓迎しますが、人格否定や攻撃的な言葉遣いは控えてください。"
-            ),
+            value="• すべての参加者・メンター・スポンサー・運営に対し、**敬意を持って**接してください。\n• 人種・性別・年齢・宗教・性的指向・障がい・国籍に基づく差別的な発言は一切禁止です。\n• 相手が不快に感じる行為は、たとえ「冗談」であっても**ハラスメント**に該当します。\n• 建設的な批判は歓迎しますが、人格否定や攻撃的な言葉遣いは控えてください。",
             inline=False,
         )
-        rule_embed1.add_field(name="\u200b", value="\u200b", inline=False)
         rule_embed1.add_field(
             name="💬 2. チャンネルの適切な利用",
-            value=(
-                "\n"
-                "• 各チャンネルは目的ごとに分かれています。**チャンネルの趣旨に沿った投稿**をお願いします。\n"
-                f"• 迷ったら {m(lounge_ch, '☕雑談ラウンジ')} へ！ハッカソンに関係ない話題もOKです。"
-            ),
+            value=f"• 各チャンネルは目的ごとに分かれています。**チャンネルの趣旨に沿った投稿**をお願いします。\n• 迷ったら {m(lounge_ch, '☕雑談ラウンジ')} へ！ハッカソンに関係ない話題もOKです。",
             inline=False,
         )
-        rule_embed1.add_field(name="\u200b", value="\u200b", inline=False)
         rule_embed1.add_field(
             name="🚫 3. スパム・宣伝の禁止",
-            value=(
-                "\n"
-                "• 無許可の宣伝・勧誘・営業活動は禁止です。\n"
-                "• 同じ内容の連投、不必要な @everyone / @here の使用はおやめください。\n"
-                "• 外部サーバーへの招待リンクの無断投稿も禁止です。"
-            ),
+            value="• 無許可の宣伝・勧誘・営業活動は禁止です。\n• 同じ内容の連投、不必要な @everyone / @here の使用はおやめください。\n• 外部サーバーへの招待リンクの無断投稿も禁止です。",
             inline=False,
         )
 
         rule_embed2 = discord.Embed(color=0xFF5252)
         rule_embed2.add_field(
             name="🔒 4. プライバシーとセキュリティ",
-            value=(
-                "\n"
-                "• 他の参加者の**個人情報**（本名・住所・電話番号・写真等）を本人の同意なく公開することは厳禁です。\n"
-                "• スクリーンショットの無断転載、DM内容の外部公開もお控えください。\n"
-                "• 不審なリンクやファイルの共有を発見した場合は、すぐに運営へ報告をお願いします。"
-            ),
+            value="• 他の参加者の**個人情報**（本名・住所・電話番号・写真等）を本人の同意なく公開することは厳禁です。\n• スクリーンショットの無断転載、DM内容の外部公開もお控えください。\n• 不審なリンクやファイルの共有を発見した場合は、すぐに運営へ報告をお願いします。",
             inline=False,
         )
-        rule_embed2.add_field(name="\u200b", value="\u200b", inline=False)
         rule_embed2.add_field(
             name="©️ 5. 著作権の尊重",
-            value=(
-                "\n"
-                "• 第三者の著作物（コード・画像・音楽等）を使用する場合は、**ライセンスを必ず確認**してください。\n"
-                "• 海賊版ソフトウェアや不正に入手したAPIキーの使用は厳禁です。\n"
-                "• オープンソースライセンス（MIT, Apache等）の活用を推奨します。"
-            ),
+            value="• 第三者の著作物（コード・画像・音楽等）を使用する場合は、**ライセンスを必ず確認**してください。\n• 海賊版ソフトウェアや不正に入手したAPIキーの使用は厳禁です。\n• オープンソースライセンス（MIT, Apache等）の活用を推奨します。",
             inline=False,
         )
-        rule_embed2.add_field(name="\u200b", value="\u200b", inline=False)
         rule_embed2.add_field(
             name="👨‍🏫 6. メンター・スタッフへの相談マナー",
-            value=(
-                "\n"
-                "• メンターやスタッフへの質問は、原則として**公開チャンネル**をご利用ください。\n"
-                "• DMでの直接連絡は、相手から許可がない限りお控えください。\n"
-                "• 質問の際は「何を試したか」「どこで詰まっているか」を具体的に伝えると、スムーズです。"
-            ),
+            value="• メンターやスタッフへの質問は、原則として**公開チャンネル**をご利用ください。\n• DMでの直接連絡は、相手から許可がない限りお控えください。\n• 質問の際は「何を試したか」「どこで詰まっているか」を具体的に伝えると、スムーズです。",
             inline=False,
         )
 
         rule_embed3 = discord.Embed(color=0xFF5252)
         rule_embed3.add_field(
             name="⚠️ 7. 違反時の対応",
-            value=(
-                "\n"
-                "ルール違反が確認された場合、運営チームは以下の措置を取る場合があります。\n\n"
-                "`\n"
-                "🟡 軽度 → 注意・警告（DM or チャンネル内）\n"
-                "🟠 中度 → 一時的なミュート・チャンネルアクセス制限\n"
-                "🔴 重度 → サーバーからのキック / 永久BAN\n"
-                "`\n"
-                "※悪質なハラスメントや脅迫行為は、**即座にBAN**とし、必要に応じて関係機関に通報します。"
-            ),
+            value="ルール違反が確認された場合、運営チームは以下の措置を取る場合があります。\n\n`\n🟡 軽度 → 注意・警告（DM or チャンネル内）\n🟠 中度 → 一時的なミュート・チャンネルアクセス制限\n🔴 重度 → サーバーからのキック / 永久BAN\n`\n※悪質なハラスメントや脅迫行為は、**即座にBAN**とし、必要に応じて関係機関に通報します。",
             inline=False,
         )
-        rule_embed3.add_field(name="\u200b", value="\u200b", inline=False)
         rule_embed3.add_field(
             name="📋 8. Discordの利用規約",
-            value=(
-                "\n"
-                "• 本サーバーのすべてのユーザーは、[Discord利用規約](https://discord.com/terms) および "
-                "[コミュニティガイドライン](https://discord.com/guidelines) を遵守する義務があります。\n"
-                "• 13歳未満の方はDiscordの利用規約に基づきご利用いただけません。"
-            ),
+            value="• 本サーバーのすべてのユーザーは、[Discord利用規約](https://discord.com/terms) および [コミュニティガイドライン](https://discord.com/guidelines) を遵守する義務があります。\n• 13歳未満の方はDiscordの利用規約に基づきご利用いただけません。",
             inline=False,
         )
-        rule_embed3.add_field(name="\u200b", value="\u200b", inline=False)
         rule_embed3.add_field(
             name="🆘 困ったとき・報告したいとき",
-            value=(
-                "\n"
-                "• ルール違反を目撃した場合、または自身が被害を受けた場合は、\n"
-                f"　{m(sos_ch, '🆘SOS窓口')} チャンネルまたは運営メンバーへのDMでご連絡ください。\n"
-                "• 報告者のプライバシーは厳守します。安心してご相談ください。\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "📌 *本ルールは運営の判断により予告なく更新される場合があります。*\n"
-                "📌 *最終更新: 2026年5月29日*"
-            ),
+            value=f"• ルール違反を目撃した場合、または自身が被害を受けた場合は、\n　{m(sos_ch, '🆘SOS窓口')} チャンネルまたは運営メンバーへのDMでご連絡ください。\n• 報告者のプライバシーは厳守します。安心してご相談ください。\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 *本ルールは運営の判断により予告なく更新される場合があります。*\n📌 *最終更新: 2026年5月30日*",
             inline=False,
         )
 
         await rule_ch.send(embeds=[rule_embed1, rule_embed2, rule_embed3], silent=True)
-        results.append(f"✅ {rule_ch.name}")
-    else:
-        results.append("⚠️ ルール・ガイドライン — チャンネルが見つかりません")
 
     if guide_ch:
         try:
             await guide_ch.purge(limit=50)
             results.append("🧹 🗺️｜歩き方ガイド の過去メッセージを清掃しました")
         except Exception as e:
-            results.append(f"⚠️ 🗺️｜歩き方ガイド の清掃に失敗しました: {e}")
+            pass
         guide_embed1 = discord.Embed(
             title="🗺️ サーバーの歩き方ガイド",
-            description=(
-                "「チャンネルが多くてどこを見ればいいかわからない！」\n"
-                "そんな方のために、このサーバーの全体マップをお届けします。\n"
-                "目的に合ったチャンネルを活用して、コミュニティを最大限楽しみましょう！\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━"
-            ),
+            description="「チャンネルが多くてどこを見ればいいかわからない！」\nそんな方のために、このサーバーの全体マップをお届けします。\n目的に合ったチャンネルを活用して、コミュニティを最大限楽しみましょう！\n\n━━━━━━━━━━━━━━━━━━━━━━━━",
             color=0x448AFF,
         )
         guide_embed1.add_field(
             name="🚀 WELCOME & ONBOARDING — まずはここから",
-            value=(
-                "\n"
-                f"🏁 {m(welcome_ch, 'ようこそ')} — 最初に読むサーバーの紹介\n"
-                f"📜 {m(rule_ch, 'ルール・ガイドライン')} — 必ず最初に目を通してください\n"
-                f"✅ {m(role_ch, 'ロール付与')} — 自分の基本情報とスキルを登録しよう\n"
-                f"🗺️ {m(guide_ch, '歩き方ガイド')} — このページです"
-            ),
+            value=f"🏁 {m(welcome_ch, 'ようこそ')} — 最初に読むサーバーの紹介\n📜 {m(rule_ch, 'ルール・ガイドライン')} — 必ず最初に目を通してください\n✅ {m(role_ch, 'ロール付与')} — 自分の基本情報とスキルを登録しよう\n🗺️ {m(guide_ch, '歩き方ガイド')} — このページです",
             inline=False,
         )
-        guide_embed1.add_field(name="\u200b", value="\u200b", inline=False)
         guide_embed1.add_field(
             name="📢 ANNOUNCEMENTS — 見逃し厳禁！運営からのお知らせ",
-            value=(
-                "\n"
-                "🔔 **全体アナウンス** — 最重要の連絡事項（※書き込み不可・閲覧専用）\n"
-                "📅 **イベントカレンダー** — フェーズごとの日程、〆切リマインド\n"
-                "🏆 **審査・アワード情報** — 審査基準・賞金・賞品の詳細\n"
-                "🎁 **協賛企業からのお知らせ** — API無料枠・企業賞などの情報"
-            ),
+            value=f"🔔 {m(announce_ch, '全体アナウンス')} — 最重要の連絡事項（※書き込み不可・閲覧専用）\n📅 {m(calendar_ch, 'イベントカレンダー')} — フェーズごとの日程、〆切リマインド\n🏆 {m(award_ch, '審査・アワード情報')} — 審査基準・賞金・賞品の詳細\n🎁 {m(sponsor_info_ch, '協賛企業からのお知らせ')} — API無料枠・企業賞などの情報",
             inline=False,
         )
-        guide_embed1.add_field(name="\u200b", value="\u200b", inline=False)
         guide_embed1.add_field(
             name="💬 COMMUNITY & NETWORKING — 仲間をつくろう",
-            value=(
-                "\n"
-                f"👋 {m(intro_ch, '自己紹介')} — 挨拶をして他のメンバーに自分を知ってもらおう！\n"
-                f"☕ {m(lounge_ch, '雑談ラウンジ')} — テーマ自由のフリートーク（息抜きに最適）\n"
-                "📰 **AI・テックニュース** — 最新のAI動向や使えそうなツールの共有\n"
-                "📚 **役立ちリソース共有** — 便利な記事・テンプレートの共有\n"
-                "📸 **写真・スクショ共有** — 開発中の画面やイベントの思い出"
-            ),
+            value=f"👋 {m(intro_ch, '自己紹介')} — 挨拶をして他のメンバーに自分を知ってもらおう！\n☕ {m(lounge_ch, '雑談ラウンジ')} — テーマ自由のフリートーク（息抜きに最適）\n📰 {m(news_ai_ch, 'aiテックニュース')} — 最新のAI動向や使えそうなツールの共有\n📰 {m(news_youth_ch, '若手ニュース')} — 若手向けの有益な情報\n📚 {m(resource_ch, 'リソース共有')} — 便利な記事・テンプレートの共有\n📸 {m(photo_ch, '写真・スクショ共有')} — 開発中の画面やイベントの思い出",
             inline=False,
         )
 
         guide_embed2 = discord.Embed(color=0x448AFF)
         guide_embed2.add_field(
             name="🤝 TEAM BUILDING — チームを結成しよう",
-            value=(
-                "\n"
-                "🤝 **メンバー募集** — 「エンジニア求む！」の募集投稿\n"
-                "🙋‍♀️ **チーム加入希望** — 「こんなスキルあります！」のアピール投稿\n"
-                "💡 **アイデア共有・壁打ち** — アイデアを投げてフィードバックをもらう\n\n"
-                "💡 **ヒント**: 募集チャンネル等で発言すると、Botがフォーマットを自動で案内してくれます！"
-            ),
+            value=f"🤝 {m(recruit_ch, 'メンバー募集')} — 「エンジニア求む！」の募集投稿\n🙋‍♀️ {m(join_ch, 'チーム加入希望')} — 「こんなスキルあります！」のアピール投稿\n💡 {m(idea_ch, 'アイデア共有・壁打ち')} — アイデアを投げてフィードバックをもらう\n\n💡 **ヒント**: 募集チャンネル等で発言すると、Botがフォーマットを自動で案内してくれます！",
             inline=False,
         )
-        guide_embed2.add_field(name="\u200b", value="\u200b", inline=False)
         guide_embed2.add_field(
             name="❓ SUPPORT & HELPDESK — 困ったらここ",
-            value=(
-                "\n"
-                f"❓ {m(question_ch, '運営への質問')} — 日程・ルールに関する一般的な質問\n"
-                "🛠️ **技術サポート_AI** — ChatGPT/Claude等のAPI連携やプロンプトの相談\n"
-                "🛠️ **技術サポート_ノーコード** — Make, Bubble, Glide等の使い方の質問\n"
-                f"🆘 {m(sos_ch, 'SOS窓口')} — 緊急トラブル（チームとの連絡不通・機材故障等）"
-            ),
+            value=f"❓ {m(question_ch, '運営への質問')} — 日程・ルールに関する一般的な質問\n🛠️ {m(tech_ai_ch, '技術サポート_ai')} — ChatGPT/Claude等のAPI連携やプロンプトの相談\n🛠️ {m(tech_nocode_ch, '技術サポート_ノーコード')} — Make, Bubble, Glide等の使い方の質問\n🆘 {m(sos_ch, 'SOS窓口')} — 緊急トラブル（チームとの連絡不通・機材故障等）",
             inline=False,
         )
-        guide_embed2.add_field(name="\u200b", value="\u200b", inline=False)
         guide_embed2.add_field(
             name="🏢 SPONSORS & MENTORS — 心強い味方たち",
-            value=(
-                "\n"
-                "👨‍🏫 **メンター紹介** — 参加メンターの得意領域・プロフィール\n"
-                "🙋‍♂️ **メンタリング予約** — メンターへの壁打ち・技術相談の予約\n"
-                "🏢 **スポンサーブース** — 各協賛企業との交流・質問"
-            ),
+            value=f"👨‍🏫 {m(mentor_intro_ch, 'メンター紹介')} — 参加メンターの得意領域・プロフィール\n🙋‍♂️ {m(mentor_reserve_ch, 'メンタリング予約')} — メンターへの壁打ち・技術相談の予約\n🏢 {m(sponsor_booth_ch, 'スポンサーブース')} — 各協賛企業との交流・質問",
             inline=False,
         )
 
@@ -548,50 +601,157 @@ async def setup_onboarding(interaction: discord.Interaction):
         guide_embed3.set_footer(text="ABCABC AI Hackathon 2026 運営チーム")
 
         await guide_ch.send(embeds=[guide_embed1, guide_embed2, guide_embed3], silent=True)
-        results.append("✅ 🗺️｜歩き方ガイド")
-    else:
-        results.append("⚠️ 🗺️｜歩き方ガイド — チャンネルが見つかりません")
 
     if role_ch:
         try:
             await role_ch.purge(limit=50)
-            results.append("🧹 ✅｜ロール付与 の過去メッセージを清掃しました")
-        except Exception as e:
-            results.append(f"⚠️ ✅｜ロール付与 の清掃に失敗しました: {e}")
-        # Message 1
+        except Exception:
+            pass
         role_embed1 = discord.Embed(
             title="✅ STEP 1：基本プロフィールと興味ある職種を登録しよう",
-            description=(
-                "サーバー内での交流やチームビルディング（仲間探し）を円滑にするための大切な登録です！\n"
-                "下のプルダウンメニューから、あなたに当てはまるものや興味のある分野を登録してください。\n\n"
-                "📌 **【超重要】興味のある職種は『全部チェック』が断然おすすめ！**\n"
-                "チームメンバーを募集したり探したりする際、ここで選んだ職種ロールが最大の目印になります。\n"
-                "「本職はエンジニアだけど、ビジネスや企画にも関わってみたい」「デザインを勉強中・少し興味がある」といった場合も、**少しでも関心があれば【すべて】チェックを入れておくのがおすすめです！**\n\n"
-                "💡 **どれを選べばいいか迷ったら？**\n"
-                "「自分に何ができるか分からない…」「まだ未経験だし…」という場合でも、**少しでも面白そう、関係しそうだと思う職種には【全部チェック】を入れておくことを強くお勧めします！**\n"
-                "チェックを多く入れておくことで、他のメンバーから声をかけてもらえるチャンスが格段に増え、新しい挑戦への第一歩になります！✨\n\n"
-                "※プルダウンは複数選択が可能です（タップ/クリックするたびに追加・解除が切り替わります）。"
-            ),
+            description="サーバー内での交流やチームビルディング（仲間探し）を円滑にするための大切な登録です！\n下のプルダウンメニューから、あなたに当てはまるものや興味のある分野を登録してください。\n\n📌 **【超重要】興味のある職種は『全部チェック』が断然おすすめ！**\nチームメンバーを募集したり探したりする際、ここで選んだ職種ロールが最大の目印になります。\n「本職はエンジニアだけど、ビジネスや企画にも関わってみたい」「デザインを勉強中・少し興味がある」といった場合も、**少しでも関心があれば【すべて】チェックを入れておくのがおすすめです！**\n\n💡 **どれを選べばいいか迷ったら？**\n「自分に何ができるか分からない…」「まだ未経験だし…」という場合でも、**少しでも面白そう、関係しそうだと思う職種には【全部チェック】を入れておくことを強くお勧めします！**\nチェックを多く入れておくことで、他のメンバーから声をかけてもらえるチャンスが格段に増え、新しい挑戦への第一歩になります！✨\n\n※プルダウンは複数選択が可能です（タップ/クリックするたびに追加・解除が切り替わります）。",
             color=0xFFAB00,
         )
         await role_ch.send(embed=role_embed1, view=BasicProfileView(), silent=True)
 
-        # Message 2
         role_embed2 = discord.Embed(
             title="🛠️ STEP 2：スキル・ツールを登録しよう",
-            description="さらに、使用経験のあるプログラミング言語やAIツールを選択してアピールしましょう！\n\n                💡 **Tip**: 「少しだけ触ったことがある」程度のツールでも、とりあえずチェックを入れておくのがオススメです！思わぬ共通点で会話が弾むかも？🙌",
+            description="さらに、使用経験のあるプログラミング言語やAIツールを選択してアピールしましょう！\n\n💡 **Tip**: 「少しだけ触ったことがある」程度のツールでも、とりあえずチェックを入れておくのがオススメです！思わぬ共通点で会話が弾むかも？🙌",
             color=0xFFAB00,
         )
         await role_ch.send(embed=role_embed2, view=SkillsToolsView(), silent=True)
 
-        results.append("✅ ✅｜ロール付与 (分割メッセージ)")
-    else:
-        results.append("⚠️ ✅｜ロール付与 — チャンネルが見つかりません")
-
     summary = "\n".join(results)
-    await interaction.followup.send(
-        f"**オンボーディング セットアップ完了！**\n\n{summary}\n\n各チャンネルを確認してください。",
-    )
+    await interaction.followup.send(f"**オンボーディング セットアップ完了！**\n\n{summary}\n\n各チャンネルを確認してください。")
+
+@client.tree.command(name="setup_permissions", description="【運営用】ロールとチャンネルの権限を一括設定します")
+@app_commands.default_permissions(administrator=True)
+async def setup_permissions(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    
+    # === ロールの取得・作成 ===
+    def get_or_create_role(name):
+        return discord.utils.get(guild.roles, name=name)
+        
+    ume_role = get_or_create_role("運営統括")
+    mgmt_role = get_or_create_role("運営メンバー")
+    kikaku_role = get_or_create_role("企画進行班")
+    koho_role = get_or_create_role("広報班")
+    renkei_role = get_or_create_role("外部連携班")
+    staff_role = get_or_create_role("スタッフ")
+    
+    sponsor_role = get_or_create_role("スポンサー")
+    kyosai_role = get_or_create_role("共催")
+    judge_role = get_or_create_role("審査員")
+    mentor_role = get_or_create_role("メンター")
+    
+    participant_role = get_or_create_role("参加者")
+    
+    # 万が一ロールが無ければ作成（今回は作成済み前提とするが最低限のフォロー）
+    for r_name in ["運営統括", "運営メンバー", "企画進行班", "広報班", "外部連携班", "企画進行班リーダー", "広報班リーダー", "外部連携班リーダー", "企画進行班リーダー", "広報班リーダー", "外部連携班リーダー", "広報班", "外部連携班", "スタッフ", "スポンサー", "共催", "審査員", "メンター", "参加者"]:
+        if not get_or_create_role(r_name):
+            try:
+                await guild.create_role(name=r_name)
+            except Exception:
+                pass
+
+    ume_role = get_or_create_role("運営統括")
+    mgmt_role = get_or_create_role("運営メンバー")
+    kikaku_role = get_or_create_role("企画進行班")
+    koho_role = get_or_create_role("広報班")
+    renkei_role = get_or_create_role("外部連携班")
+    staff_role = get_or_create_role("スタッフ")
+    sponsor_role = get_or_create_role("スポンサー")
+    kyosai_role = get_or_create_role("共催")
+    judge_role = get_or_create_role("審査員")
+    mentor_role = get_or_create_role("メンター")
+    participant_role = get_or_create_role("参加者")
+
+    # === ロール権限の基本設定 ===
+    if ume_role:
+        try:
+            perms = discord.Permissions.all()
+            await ume_role.edit(permissions=perms)
+        except Exception:
+            pass
+
+    # 削除権限などを消すためのベース権限
+    base_perms = discord.Permissions.general()
+    base_perms.manage_channels = False
+    base_perms.manage_roles = False
+    base_perms.manage_webhooks = False
+    base_perms.manage_messages = False
+    base_perms.manage_guild = False
+    base_perms.administrator = False
+
+    for r in [mgmt_role, kikaku_role, koho_role, renkei_role, staff_role]:
+        if r:
+            try:
+                await r.edit(permissions=base_perms)
+            except Exception:
+                pass
+                
+    # === チャンネルごとの権限設定 ===
+    # 運営系チャンネル
+    planning_txt = discord.utils.get(guild.text_channels, name="📁｜企画進行")
+    planning_vc = discord.utils.get(guild.voice_channels, name="🔊｜企画進行vc")
+    pr_txt = discord.utils.get(guild.text_channels, name="📁｜広報")
+    pr_vc = discord.utils.get(guild.voice_channels, name="🔊｜広報vc")
+    ext_txt = discord.utils.get(guild.text_channels, name="📁｜外部連携")
+    ext_vc = discord.utils.get(guild.voice_channels, name="🔊｜外部連携vc")
+    
+    admin_channels = [planning_txt, planning_vc, pr_txt, pr_vc, ext_txt, ext_vc]
+    
+    # 運営系チャンネルへの共通設定（一般参加者、スポンサー等は完全不可視）
+    for ch in admin_channels:
+        if ch:
+            try:
+                await ch.set_permissions(guild.default_role, view_channel=False)
+                for r in [sponsor_role, kyosai_role, judge_role, mentor_role, participant_role]:
+                    if r:
+                        await ch.set_permissions(r, view_channel=False)
+                
+                # 運営メンバー全体は見れる
+                if mgmt_role:
+                    await ch.set_permissions(mgmt_role, view_channel=True, send_messages=True)
+                if ume_role:
+                    await ch.set_permissions(ume_role, view_channel=True, send_messages=True, manage_messages=True)
+            except Exception:
+                pass
+                
+    # 各班専用の設定（他の班は見る専）
+    # 企画進行班
+    for ch in [planning_txt, planning_vc]:
+        if ch:
+            if kikaku_role:
+                await ch.set_permissions(kikaku_role, send_messages=True, manage_messages=True)
+            if koho_role:
+                await ch.set_permissions(koho_role, send_messages=False)
+            if renkei_role:
+                await ch.set_permissions(renkei_role, send_messages=False)
+                
+    # 広報班
+    for ch in [pr_txt, pr_vc]:
+        if ch:
+            if koho_role:
+                await ch.set_permissions(koho_role, send_messages=True, manage_messages=True)
+            if kikaku_role:
+                await ch.set_permissions(kikaku_role, send_messages=False)
+            if renkei_role:
+                await ch.set_permissions(renkei_role, send_messages=False)
+                
+    # 外部連携班
+    for ch in [ext_txt, ext_vc]:
+        if ch:
+            if renkei_role:
+                await ch.set_permissions(renkei_role, send_messages=True, manage_messages=True)
+            if kikaku_role:
+                await ch.set_permissions(kikaku_role, send_messages=False)
+            if koho_role:
+                await ch.set_permissions(koho_role, send_messages=False)
+
+    await interaction.followup.send("✅ 権限のセットアップが完了しました！")
 
 @client.tree.command(name="create_missing_roles", description="不足しているロールをすべて作成します")
 @app_commands.default_permissions(administrator=True)
@@ -671,6 +831,67 @@ async def initialize_sticky_messages():
                 except Exception as e:
                     print(f"Error initializing sticky for {channel.name}: {e}")
 
+
+@client.event
+async def on_voice_state_update(member, before, after):
+    # Dynamic VC logic
+    if after.channel:
+        cat = after.channel.category
+        if cat:
+            empty_vcs = [vc for vc in cat.voice_channels if len(vc.members) == 0]
+            if len(empty_vcs) == 0:
+                base_name = after.channel.name
+                import re
+                base_name = re.sub(r' \d+$', '', base_name)
+                new_name = f"{base_name} {len(cat.voice_channels) + 1}"
+                try:
+                    await cat.create_voice_channel(name=new_name)
+                except:
+                    pass
+                
+    if before.channel:
+        cat = before.channel.category
+        if cat and len(before.channel.members) == 0:
+            empty_vcs = [vc for vc in cat.voice_channels if len(vc.members) == 0]
+            if len(empty_vcs) > 1:
+                import re
+                if re.search(r' \d+$', before.channel.name):
+                    try:
+                        await before.channel.delete()
+                    except:
+                        pass
+
+@client.event
+async def on_reaction_add(reaction, user):
+    if user.bot: return
+    if reaction.message.author == user: return
+    target_user = reaction.message.author
+    if target_user.bot: return
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT xp, level FROM users WHERE user_id = ?', (target_user.id,))
+    row = c.fetchone()
+    if row:
+        xp = row[0] + 10
+        level = row[1]
+    else:
+        xp = 10
+        level = 1
+        
+    new_level = (xp // 50) + 1
+    leveled_up = new_level > level
+    
+    c.execute('INSERT OR REPLACE INTO users (user_id, xp, level) VALUES (?, ?, ?)', (target_user.id, xp, new_level))
+    conn.commit()
+    conn.close()
+    
+    if leveled_up:
+        try:
+            await reaction.message.channel.send(f"🎉 {target_user.mention} がレベルアップしました！ (Lv.{new_level})")
+        except:
+            pass
+
 @client.event
 async def on_ready():
     print(f'Logged in as {client.user} (ID: {client.user.id})')
@@ -680,8 +901,33 @@ async def on_ready():
 
 @client.event
 async def on_message(message: discord.Message):
+    # コミュニティ・アップデートの翻訳
+    ch_name = getattr(message.channel, 'name', '').lower()
+    if "コミュニティ・アップデート" in ch_name or "community-updates" in ch_name or "コミュニティアップデート" in ch_name:
+        # 英語のメッセージが来たら翻訳する (botでもwebhookでもユーザーでも翻訳)
+        content_text = message.content or ""
+        # Embedがある場合はEmbedの説明文も対象にする
+        for emb in message.embeds:
+            if emb.description:
+                content_text += "\n" + emb.description
+                
+        if content_text.strip():
+            try:
+                translated = GoogleTranslator(source='auto', target='ja').translate(content_text)
+                if translated:
+                    await message.reply(f"🇯🇵 **自動翻訳:**\n{translated}", silent=True)
+            except Exception as e:
+                print(f"Translation failed: {e}")
+
     if message.author.bot:
         return
+    # AI技術サポート
+    if "技術サポート" in ch_name and client.user.mentioned_in(message):
+        async with message.channel.typing():
+            prompt = message.content.replace(f'<@{client.user.id}>', '').strip()
+            answer = await ask_gemini(prompt)
+            await message.reply(answer)
+
     template_text = _match_template(getattr(message.channel, 'name', ''))
     if not template_text:
         return
@@ -699,6 +945,101 @@ async def on_message(message: discord.Message):
         sticky_messages[message.channel.id] = new_msg.id
     except Exception as e:
         print(f"Error sending sticky message: {e}")
+
+
+@client.tree.command(name="task", description="【リーダー・運営専用】タスク用のチャンネルを生成します")
+async def create_task(interaction: discord.Interaction, assignee: discord.Member, title: str):
+    allowed_roles = ["運営統括", "企画進行班リーダー", "広報班リーダー", "外部連携班リーダー"]
+    has_role = any(r.name in allowed_roles for r in interaction.user.roles)
+    if not has_role and not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+        return
+        
+    await interaction.response.defer(ephemeral=False)
+    guild = interaction.guild
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(read_messages=False),
+        interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+        assignee: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+    }
+    cat = interaction.channel.category
+    new_ch = await guild.create_text_channel(name=f"📝-{title}", category=cat, overwrites=overwrites)
+    await new_ch.send(f"{assignee.mention} 新しいタスク「{title}」が割り当てられました！\n進捗が変わったら `/status` コマンドで状態を更新してください。")
+    await interaction.followup.send(f"タスクチャンネル {new_ch.mention} を作成しました。")
+
+@client.tree.command(name="status", description="タスクチャンネルの進捗ステータスを更新します")
+@app_commands.choices(state=[
+    app_commands.Choice(name="順調", value="🟢"),
+    app_commands.Choice(name="やや遅れ", value="🟡"),
+    app_commands.Choice(name="SOS", value="🔴"),
+    app_commands.Choice(name="完了", value="✅")
+])
+async def update_status(interaction: discord.Interaction, state: app_commands.Choice[str]):
+    ch = interaction.channel
+    old_name = ch.name
+    import re
+    clean_name = re.sub(r'^[🟢🟡🔴✅📝]-', '', old_name)
+    new_name = f"{state.value}-{clean_name}"
+    await ch.edit(name=new_name)
+    await interaction.response.send_message(f"ステータスを {state.name} に更新しました！")
+
+@client.tree.command(name="timer", description="指定分数後にメンションでお知らせします")
+async def timer_cmd(interaction: discord.Interaction, minutes: int, message: str = "時間です！"):
+    await interaction.response.send_message(f"{minutes}分後にアラームをセットしました。")
+    await asyncio.sleep(minutes * 60)
+    await interaction.channel.send(f"{interaction.user.mention} ⏰ {message}")
+
+@client.tree.command(name="set_deadline", description="【運営用】提出期限（カウントダウン目標日時）を設定します")
+@app_commands.default_permissions(administrator=True)
+async def set_deadline(interaction: discord.Interaction, target_time: str):
+    # format: YYYY-MM-DD HH:MM
+    try:
+        dt = datetime.datetime.strptime(target_time, "%Y-%m-%d %H:%M")
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('deadline', ?)", (dt.isoformat(),))
+        conn.commit()
+        conn.close()
+        await interaction.response.send_message(f"提出期限を {target_time} に設定しました。")
+    except Exception:
+        await interaction.response.send_message("フォーマットが違います。例: 2026-06-30 18:00", ephemeral=True)
+
+@client.tree.command(name="schedule_message", description="【運営用】指定日時にメッセージを予約送信します")
+@app_commands.default_permissions(administrator=True)
+async def schedule_message(interaction: discord.Interaction, target_time: str, channel: discord.TextChannel, message: str):
+    # format: YYYY-MM-DD HH:MM
+    try:
+        dt = datetime.datetime.strptime(target_time, "%Y-%m-%d %H:%M")
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT INTO schedules (channel_id, send_at, message) VALUES (?, ?, ?)", (channel.id, dt.strftime("%Y-%m-%d %H:%M"), message))
+        conn.commit()
+        conn.close()
+        await interaction.response.send_message(f"{channel.mention} 宛に {target_time} に送信予約しました。")
+    except Exception:
+        await interaction.response.send_message("フォーマットが違います。例: 2026-06-30 18:00", ephemeral=True)
+
+@client.tree.command(name="add_knowledge", description="【運営用】AIのナレッジベース（RAG）に情報を追加します")
+@app_commands.default_permissions(administrator=True)
+async def add_knowledge(interaction: discord.Interaction, text: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO knowledge (content) VALUES (?)", (text,))
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message("ナレッジを追加しました！AIがこれを参考に回答するようになります。")
+
+@client.tree.command(name="spawn_sos_button", description="【運営用】SOS窓口にメンター呼び出しボタンを設置します")
+@app_commands.default_permissions(administrator=True)
+async def spawn_sos_button(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🆘 メンター呼び出し窓口", 
+        description="技術的に詰まった、または運営に緊急で相談したい場合は、下のボタンを押してください。\n待機中のメンター・スタッフに通知が飛びます！", 
+        color=0xFF5252
+    )
+    await interaction.channel.send(embed=embed, view=MentorSummonView())
+    await interaction.response.send_message("ボタンを設置しました。", ephemeral=True)
+
 
 def run_health_check_server():
     port = int(os.getenv("PORT", "8080"))
