@@ -282,7 +282,7 @@ class MyClient(discord.Client):
                 diff = deadline - now
                 hours = int(diff.total_seconds() // 3600)
                 
-                ch = discord.utils.find(lambda c: "⏳｜残り" in c.name, guild.voice_channels)
+                ch = discord.utils.find(lambda c: "⏳｜" in c.name, guild.voice_channels)
                 if hours >= 0:
                     new_name = f"⏳｜残り {hours}時間"
                 else:
@@ -295,6 +295,14 @@ class MyClient(discord.Client):
                     await guild.create_voice_channel(name=new_name, position=0)
             except Exception as e:
                 print(f"Deadline loop error: {e}")
+        else:
+            try:
+                # 提出期限が設定されていない場合は、残っているカウントダウン用VCを自動で削除
+                for ch in guild.voice_channels:
+                    if "⏳｜" in ch.name:
+                        await ch.delete()
+            except Exception as e:
+                print(f"Deadline loop cleanup error: {e}")
 
     @tasks.loop(minutes=1)
     async def schedule_loop(self):
@@ -1003,6 +1011,32 @@ async def set_deadline(interaction: discord.Interaction, target_time: str):
         await interaction.response.send_message(f"提出期限を {target_time} に設定しました。")
     except Exception:
         await interaction.response.send_message("フォーマットが違います。例: 2026-06-30 18:00", ephemeral=True)
+
+@client.tree.command(name="cancel_deadline", description="【運営用】提出期限の設定をクリアし、カウントダウンチャンネルをすべて削除します")
+@app_commands.default_permissions(administrator=True)
+async def cancel_deadline(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("DELETE FROM settings WHERE key='deadline'")
+        conn.commit()
+        conn.close()
+        
+        # 既存のカウントダウン用VCをすべて削除する
+        guild = interaction.guild
+        deleted_count = 0
+        for ch in guild.voice_channels:
+            if "⏳｜" in ch.name:
+                try:
+                    await ch.delete()
+                    deleted_count += 1
+                except Exception as e:
+                    print(f"Failed to delete channel {ch.name}: {e}")
+                    
+        await interaction.followup.send(f"提出期限の設定を解除し、カウントダウンチャンネルを削除しました（削除件数: {deleted_count}件）。")
+    except Exception as e:
+        await interaction.followup.send(f"エラーが発生しました: {e}")
 
 @client.tree.command(name="schedule_message", description="【運営用】指定日時にメッセージを予約送信します")
 @app_commands.default_permissions(administrator=True)
