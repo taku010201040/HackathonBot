@@ -420,6 +420,7 @@ async def setup_onboarding(interaction: discord.Interaction):
     news_youth_ch = await ensure_channel(guild, "📰｜若手ニュース", "COMMUNITY")
     resource_ch = await ensure_channel(guild, "📚｜リソース共有", "COMMUNITY")
     photo_ch = await ensure_channel(guild, "📸｜写真・スクショ共有", "COMMUNITY")
+    level_notify_ch = await ensure_channel(guild, "🏆｜レベル・通知", "COMMUNITY")
 
     recruit_ch = await ensure_channel(guild, "🤝｜メンバー募集", "TEAM BUILDING")
     join_ch = await ensure_channel(guild, "🙋‍♀️｜チーム加入希望", "TEAM BUILDING")
@@ -896,9 +897,20 @@ async def on_reaction_add(reaction, user):
     
     if leveled_up:
         try:
-            await reaction.message.channel.send(f"🎉 {target_user.mention} がレベルアップしました！ (Lv.{new_level})")
-        except:
-            pass
+            guild = reaction.message.guild
+            # 🏆｜レベル・通知 チャンネルを検索
+            level_ch = discord.utils.get(guild.text_channels, name="🏆｜レベル・通知")
+            if not level_ch:
+                # 無ければ自動で作成 (COMMUNITYカテゴリーを探す)
+                category = discord.utils.find(lambda c: "COMMUNITY" in c.name or "WELCOME" in c.name, guild.categories)
+                if category:
+                    level_ch = await guild.create_text_channel(name="🏆｜レベル・通知", category=category)
+                else:
+                    level_ch = await guild.create_text_channel(name="🏆｜レベル・通知")
+            
+            await level_ch.send(f"🎉 {target_user.mention} がレベルアップしました！ (Lv.{new_level}) 🚀")
+        except Exception as e:
+            print(f"Level notification error: {e}")
 
 @client.event
 async def on_ready():
@@ -996,6 +1008,47 @@ async def timer_cmd(interaction: discord.Interaction, minutes: int, message: str
     await interaction.response.send_message(f"{minutes}分後にアラームをセットしました。")
     await asyncio.sleep(minutes * 60)
     await interaction.channel.send(f"{interaction.user.mention} ⏰ {message}")
+
+@client.tree.command(name="level", description="現在の自分のレベルと経験値（XP）を確認します")
+async def check_level(interaction: discord.Interaction):
+    user = interaction.user
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT xp, level FROM users WHERE user_id = ?', (user.id,))
+    row = c.fetchone()
+    conn.close()
+    
+    if row:
+        xp = row[0]
+        level = row[1]
+    else:
+        xp = 0
+        level = 1
+        
+    next_level = level + 1
+    next_level_total_xp_required = level * 50
+    xp_needed_for_next = next_level_total_xp_required - xp
+    
+    current_level_base = (level - 1) * 50
+    current_level_progress = xp - current_level_base
+    progress_percent = min(max(int((current_level_progress / 50) * 100), 0), 100)
+    
+    bar_length = 10
+    filled_blocks = min(max(int(progress_percent / 10), 0), bar_length)
+    empty_blocks = bar_length - filled_blocks
+    progress_bar = "🟩" * filled_blocks + "⬜" * empty_blocks
+    
+    embed = discord.Embed(
+        title=f"📊 {user.display_name} さんのレベルステータス",
+        color=0xFFAB00
+    )
+    embed.set_thumbnail(url=user.display_avatar.url if user.display_avatar else None)
+    embed.add_field(name="🏆 現在のレベル", value=f"**Lv. {level}**", inline=True)
+    embed.add_field(name="✨ 累積経験値 (XP)", value=f"**{xp} XP**", inline=True)
+    embed.add_field(name="📈 次のレベルまで", value=f"残り **{xp_needed_for_next} XP** (合計 {next_level_total_xp_required} XP で Lv.{next_level}へ)", inline=False)
+    embed.add_field(name="🗺️ 進捗状況", value=f"{progress_bar} ({progress_percent}%)", inline=False)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @client.tree.command(name="set_deadline", description="【運営用】提出期限（カウントダウン目標日時）を設定します")
 @app_commands.default_permissions(administrator=True)
