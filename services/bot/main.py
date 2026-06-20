@@ -90,6 +90,32 @@ class RoleDropdown(discord.ui.Select):
         await interaction.followup.send(msg, ephemeral=True)
 
 
+class RuleVerifyView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        
+    @discord.ui.button(label="🟢 ルールに同意して参加する", style=discord.ButtonStyle.success, custom_id="rule_verify_accept")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        participant_role = discord.utils.get(guild.roles, name="参加者")
+        
+        if not participant_role:
+            try:
+                participant_role = await guild.create_role(name="参加者")
+            except Exception as e:
+                await interaction.followup.send("エラー: 参加者ロールの取得/作成に失敗しました。管理者にお問い合わせください。", ephemeral=True)
+                return
+                
+        if participant_role in interaction.user.roles:
+            await interaction.followup.send("既に登録が完了しています！すべてのチャンネルをご利用いただけます。", ephemeral=True)
+        else:
+            try:
+                await interaction.user.add_roles(participant_role)
+                await interaction.followup.send("ルールへの同意を確認しました！「参加者」ロールが付与され、すべてのチャンネルが解放されました 🎉", ephemeral=True)
+            except Exception as e:
+                await interaction.followup.send(f"ロールの付与に失敗しました: {e}", ephemeral=True)
+
 class MentorAcceptView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -328,6 +354,7 @@ class MyClient(discord.Client):
         self.add_view(SkillsToolsView())
         self.add_view(MentorSummonView())
         self.add_view(MentorAcceptView())
+        self.add_view(RuleVerifyView())
         self.deadline_loop.start()
         self.schedule_loop.start()
 
@@ -545,7 +572,7 @@ async def setup_onboarding(interaction: discord.Interaction):
             inline=False,
         )
 
-        await rule_ch.send(embeds=[rule_embed1, rule_embed2, rule_embed3], silent=True)
+        await rule_ch.send(embeds=[rule_embed1, rule_embed2, rule_embed3], view=RuleVerifyView(), silent=True)
 
     if guide_ch:
         try:
@@ -760,7 +787,53 @@ async def setup_permissions(interaction: discord.Interaction):
             if koho_role:
                 await ch.set_permissions(koho_role, send_messages=False)
 
-    await interaction.followup.send("✅ 権限のセットアップが完了しました！")
+    # === カテゴリーごとの認証・非表示設定 ===
+    welcome_category = discord.utils.find(lambda c: "WELCOME" in c.name, guild.categories)
+    if welcome_category:
+        # @everyone は閲覧可能、書き込み不可
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=False)
+        }
+        if ume_role:
+            overwrites[ume_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True)
+        if mgmt_role:
+            overwrites[mgmt_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+            
+        for ch in welcome_category.channels:
+            try:
+                await ch.edit(overwrites=overwrites)
+            except Exception as e:
+                print(f"Failed to set welcome channel permissions: {e}")
+
+    # WELCOME 以外のカテゴリー（参加者・運営のみ閲覧・書き込み可能）
+    for category in guild.categories:
+        if "WELCOME" in category.name or "運営" in category.name:
+            continue
+            
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False)
+        }
+        
+        if participant_role:
+            overwrites[participant_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, add_reactions=True, read_message_history=True)
+        if mentor_role:
+            overwrites[mentor_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, add_reactions=True, read_message_history=True)
+        if sponsor_role:
+            overwrites[sponsor_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, add_reactions=True, read_message_history=True)
+        if judge_role:
+            overwrites[judge_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, add_reactions=True, read_message_history=True)
+        if mgmt_role:
+            overwrites[mgmt_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True)
+        if ume_role:
+            overwrites[ume_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True)
+            
+        for ch in category.channels:
+            try:
+                await ch.edit(overwrites=overwrites)
+            except Exception as e:
+                print(f"Failed to set category channel permissions: {e}")
+
+    await interaction.followup.send("✅ 権限のセットアップが完了しました！（未同意者向けの非表示設定も適用されました）")
 
 @client.tree.command(name="create_missing_roles", description="不足しているロールをすべて作成します")
 @app_commands.default_permissions(administrator=True)
