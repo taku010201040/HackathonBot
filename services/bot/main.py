@@ -143,7 +143,7 @@ class BasicProfileView(discord.ui.View):
         super().__init__(timeout=None)
         
         self.add_item(RoleDropdown(
-            placeholder="▼ 大まかな役割（複数選択可）", custom_id="select_job", max_values=3, row=0,
+            placeholder="▼ 役割（複数選択可）", custom_id="select_job", max_values=3, row=0,
             options=[
                 discord.SelectOption(label="デザイン", value="🎨 デザイン", emoji="🎨", description="UI/UX, グラフィック等"),
                 discord.SelectOption(label="エンジニア", value="💻 エンジニア", emoji="💻", description="Web, アプリ, インフラ等"),
