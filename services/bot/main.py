@@ -87,7 +87,7 @@ class RoleDropdown(discord.ui.Select):
             msg += f"❌ 解除: " + ", ".join([r.name for r in removed])
             
         # deferしているため、followup.send を使って完了を通知
-        await interaction.followup.send(msg, ephemeral=True)
+        await interaction.followup.send(msg, ephemeral=True, silent=True)
 
 
 class RuleVerifyView(discord.ui.View):
@@ -104,17 +104,17 @@ class RuleVerifyView(discord.ui.View):
             try:
                 participant_role = await guild.create_role(name="参加者")
             except Exception as e:
-                await interaction.followup.send("エラー: 参加者ロールの取得/作成に失敗しました。管理者にお問い合わせください。", ephemeral=True)
+                await interaction.followup.send("エラー: 参加者ロールの取得/作成に失敗しました。管理者にお問い合わせください。", ephemeral=True, silent=True)
                 return
                 
         if participant_role in interaction.user.roles:
-            await interaction.followup.send("既に登録が完了しています！すべてのチャンネルをご利用いただけます。", ephemeral=True)
+            await interaction.followup.send("既に登録が完了しています！すべてのチャンネルをご利用いただけます。", ephemeral=True, silent=True)
         else:
             try:
                 await interaction.user.add_roles(participant_role)
-                await interaction.followup.send("ルールへの同意を確認しました！「参加者」ロールが付与され、すべてのチャンネルが解放されました 🎉", ephemeral=True)
+                await interaction.followup.send("ルールへの同意を確認しました！「参加者」ロールが付与され、すべてのチャンネルが解放されました 🎉", ephemeral=True, silent=True)
             except Exception as e:
-                await interaction.followup.send(f"ロールの付与に失敗しました: {e}", ephemeral=True)
+                await interaction.followup.send(f"ロールの付与に失敗しました: {e}", ephemeral=True, silent=True)
 
 class MentorAcceptView(discord.ui.View):
     def __init__(self):
@@ -342,7 +342,7 @@ class MyClient(discord.Client):
             ch = self.get_channel(ch_id)
             if ch:
                 try:
-                    await ch.send(msg)
+                    await ch.send(msg, silent=True)
                 except:
                     pass
             c.execute("DELETE FROM schedules WHERE id = ?", (sid,))
@@ -658,7 +658,7 @@ async def setup_onboarding(interaction: discord.Interaction):
         await role_ch.send(embed=role_embed2, view=SkillsToolsView(), silent=True)
 
     summary = "\n".join(results)
-    await interaction.followup.send(f"**オンボーディング セットアップ完了！**\n\n{summary}\n\n各チャンネルを確認してください。")
+    await interaction.followup.send(f"**オンボーディング セットアップ完了！**\n\n{summary}\n\n各チャンネルを確認してください。", silent=True)
 
 @client.tree.command(name="setup_permissions", description="【運営用】ロールとチャンネルの権限を一括設定します")
 @app_commands.default_permissions(administrator=True)
@@ -833,7 +833,7 @@ async def setup_permissions(interaction: discord.Interaction):
             except Exception as e:
                 print(f"Failed to set category channel permissions: {e}")
 
-    await interaction.followup.send("✅ 権限のセットアップが完了しました！（未同意者向けの非表示設定も適用されました）")
+    await interaction.followup.send("✅ 権限のセットアップが完了しました！（未同意者向けの非表示設定も適用されました）", silent=True)
 
 @client.tree.command(name="create_missing_roles", description="不足しているロールをすべて作成します")
 @app_commands.default_permissions(administrator=True)
@@ -866,9 +866,9 @@ async def create_missing_roles(interaction: discord.Interaction):
                 print(f"Failed to create role {rname}: {e}")
             
     if created:
-        await interaction.followup.send(f"以下のロールを作成しました！\n{', '.join(created)}")
+        await interaction.followup.send(f"以下のロールを作成しました！\n{', '.join(created)}", silent=True)
     else:
-        await interaction.followup.send("すべてのロールは既に存在しています。")
+        await interaction.followup.send("すべてのロールは既に存在しています。", silent=True)
 
 @client.tree.command(name="template", description="各種テンプレートを呼び出します")
 @app_commands.describe(type="呼び出したいテンプレートの種類を選択してください")
@@ -879,7 +879,7 @@ async def create_missing_roles(interaction: discord.Interaction):
 ])
 async def template_command(interaction: discord.Interaction, type: app_commands.Choice[str]):
     template_text = TEMPLATES.get(type.value, "テンプレートが見つかりませんでした。")
-    await interaction.response.send_message(template_text, ephemeral=True)
+    await interaction.response.send_message(template_text, ephemeral=True, silent=True)
 
 sticky_messages = {}
 STICKY_PREFIX = "📌 **【テンプレート】** このチャンネルでは以下をコピーしてご活用ください！"
@@ -981,7 +981,7 @@ async def on_reaction_add(reaction, user):
                 else:
                     level_ch = await guild.create_text_channel(name="🏆｜レベル・通知")
             
-            await level_ch.send(f"🎉 {target_user.mention} がレベルアップしました！ (Lv.{new_level}) 🚀")
+            await level_ch.send(f"🎉 {target_user.mention} がレベルアップしました！ (Lv.{new_level}) 🚀", silent=True)
         except Exception as e:
             print(f"Level notification error: {e}")
 
@@ -1019,7 +1019,7 @@ async def on_message(message: discord.Message):
         async with message.channel.typing():
             prompt = message.content.replace(f'<@{client.user.id}>', '').strip()
             answer = await ask_gemini(prompt)
-            await message.reply(answer)
+            await message.reply(answer, silent=True)
 
     template_text = _match_template(getattr(message.channel, 'name', ''))
     if not template_text:
@@ -1045,7 +1045,7 @@ async def create_task(interaction: discord.Interaction, assignee: discord.Member
     allowed_roles = ["運営統括", "企画進行班リーダー", "広報班リーダー", "外部連携班リーダー"]
     has_role = any(r.name in allowed_roles for r in interaction.user.roles)
     if not has_role and not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True)
+        await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True, silent=True)
         return
         
     await interaction.response.defer(ephemeral=False)
@@ -1057,8 +1057,8 @@ async def create_task(interaction: discord.Interaction, assignee: discord.Member
     }
     cat = interaction.channel.category
     new_ch = await guild.create_text_channel(name=f"📝-{title}", category=cat, overwrites=overwrites)
-    await new_ch.send(f"{assignee.mention} 新しいタスク「{title}」が割り当てられました！\n進捗が変わったら `/status` コマンドで状態を更新してください。")
-    await interaction.followup.send(f"タスクチャンネル {new_ch.mention} を作成しました。")
+    await new_ch.send(f"{assignee.mention} 新しいタスク「{title}」が割り当てられました！\n進捗が変わったら `/status` コマンドで状態を更新してください。", silent=True)
+    await interaction.followup.send(f"タスクチャンネル {new_ch.mention} を作成しました。", silent=True)
 
 @client.tree.command(name="status", description="タスクチャンネルの進捗ステータスを更新します")
 @app_commands.choices(state=[
@@ -1074,13 +1074,13 @@ async def update_status(interaction: discord.Interaction, state: app_commands.Ch
     clean_name = re.sub(r'^[🟢🟡🔴✅📝]-', '', old_name)
     new_name = f"{state.value}-{clean_name}"
     await ch.edit(name=new_name)
-    await interaction.response.send_message(f"ステータスを {state.name} に更新しました！")
+    await interaction.response.send_message(f"ステータスを {state.name} に更新しました！", silent=True)
 
 @client.tree.command(name="timer", description="指定分数後にメンションでお知らせします")
 async def timer_cmd(interaction: discord.Interaction, minutes: int, message: str = "時間です！"):
-    await interaction.response.send_message(f"{minutes}分後にアラームをセットしました。")
+    await interaction.response.send_message(f"{minutes}分後にアラームをセットしました。", silent=True)
     await asyncio.sleep(minutes * 60)
-    await interaction.channel.send(f"{interaction.user.mention} ⏰ {message}")
+    await interaction.channel.send(f"{interaction.user.mention} ⏰ {message}", silent=True)
 
 @client.tree.command(name="level", description="現在の自分のレベルと経験値（XP）を確認します")
 async def check_level(interaction: discord.Interaction):
@@ -1121,7 +1121,7 @@ async def check_level(interaction: discord.Interaction):
     embed.add_field(name="📈 次のレベルまで", value=f"残り **{xp_needed_for_next} XP** (合計 {next_level_total_xp_required} XP で Lv.{next_level}へ)", inline=False)
     embed.add_field(name="🗺️ 進捗状況", value=f"{progress_bar} ({progress_percent}%)", inline=False)
     
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True, silent=True)
 
 @client.tree.command(name="set_deadline", description="【運営用】提出期限（カウントダウン目標日時）を設定します")
 @app_commands.default_permissions(administrator=True)
@@ -1134,9 +1134,9 @@ async def set_deadline(interaction: discord.Interaction, target_time: str):
         c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('deadline', ?)", (dt.isoformat(),))
         conn.commit()
         conn.close()
-        await interaction.response.send_message(f"提出期限を {target_time} に設定しました。")
+        await interaction.response.send_message(f"提出期限を {target_time} に設定しました。", silent=True)
     except Exception:
-        await interaction.response.send_message("フォーマットが違います。例: 2026-06-30 18:00", ephemeral=True)
+        await interaction.response.send_message("フォーマットが違います。例: 2026-06-30 18:00", ephemeral=True, silent=True)
 
 @client.tree.command(name="cancel_deadline", description="【運営用】提出期限の設定をクリアし、カウントダウンチャンネルをすべて削除します")
 @app_commands.default_permissions(administrator=True)
@@ -1160,9 +1160,9 @@ async def cancel_deadline(interaction: discord.Interaction):
                 except Exception as e:
                     print(f"Failed to delete channel {ch.name}: {e}")
                     
-        await interaction.followup.send(f"提出期限の設定を解除し、カウントダウンチャンネルを削除しました（削除件数: {deleted_count}件）。")
+        await interaction.followup.send(f"提出期限の設定を解除し、カウントダウンチャンネルを削除しました（削除件数: {deleted_count}件）。", silent=True)
     except Exception as e:
-        await interaction.followup.send(f"エラーが発生しました: {e}")
+        await interaction.followup.send(f"エラーが発生しました: {e}", silent=True)
 
 @client.tree.command(name="schedule_message", description="【運営用】指定日時にメッセージを予約送信します")
 @app_commands.default_permissions(administrator=True)
@@ -1175,9 +1175,9 @@ async def schedule_message(interaction: discord.Interaction, target_time: str, c
         c.execute("INSERT INTO schedules (channel_id, send_at, message) VALUES (?, ?, ?)", (channel.id, dt.strftime("%Y-%m-%d %H:%M"), message))
         conn.commit()
         conn.close()
-        await interaction.response.send_message(f"{channel.mention} 宛に {target_time} に送信予約しました。")
+        await interaction.response.send_message(f"{channel.mention} 宛に {target_time} に送信予約しました。", silent=True)
     except Exception:
-        await interaction.response.send_message("フォーマットが違います。例: 2026-06-30 18:00", ephemeral=True)
+        await interaction.response.send_message("フォーマットが違います。例: 2026-06-30 18:00", ephemeral=True, silent=True)
 
 @client.tree.command(name="add_knowledge", description="【運営用】AIのナレッジベース（RAG）に情報を追加します")
 @app_commands.default_permissions(administrator=True)
@@ -1187,7 +1187,7 @@ async def add_knowledge(interaction: discord.Interaction, text: str):
     c.execute("INSERT INTO knowledge (content) VALUES (?)", (text,))
     conn.commit()
     conn.close()
-    await interaction.response.send_message("ナレッジを追加しました！AIがこれを参考に回答するようになります。")
+    await interaction.response.send_message("ナレッジを追加しました！AIがこれを参考に回答するようになります。", silent=True)
 
 @client.tree.command(name="spawn_sos_button", description="【運営用】SOS窓口にメンター呼び出しボタンを設置します")
 @app_commands.default_permissions(administrator=True)
