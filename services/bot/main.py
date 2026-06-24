@@ -1041,7 +1041,8 @@ async def on_message(message: discord.Message):
 
 
 @client.tree.command(name="task", description="【リーダー・運営専用】タスク用のチャンネルを生成します")
-async def create_task(interaction: discord.Interaction, assignee: discord.Member, title: str):
+@app_commands.describe(assignees="アサインするメンバーを @メンション で指定（複数指定可）", title="タスク名")
+async def create_task(interaction: discord.Interaction, assignees: str, title: str):
     allowed_roles = ["運営統括", "企画進行班リーダー", "広報班リーダー", "外部連携班リーダー"]
     has_role = any(r.name in allowed_roles for r in interaction.user.roles)
     if not has_role and not interaction.user.guild_permissions.administrator:
@@ -1050,14 +1051,38 @@ async def create_task(interaction: discord.Interaction, assignee: discord.Member
         
     await interaction.response.defer(ephemeral=False)
     guild = interaction.guild
+    
+    import re
+    # 文字列からユーザーIDをすべて抽出
+    user_ids = [int(uid) for uid in re.findall(r'<@!?(\d+)>', assignees)]
+    
+    members = []
+    for uid in set(user_ids):
+        member = guild.get_member(uid)
+        if not member:
+            try:
+                member = await guild.fetch_member(uid)
+            except Exception:
+                pass
+        if member:
+            members.append(member)
+            
+    if not members:
+        await interaction.followup.send("エラー: アサインするメンバーを @メンション で1人以上指定してください。", ephemeral=True, silent=True)
+        return
+        
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(read_messages=False),
         interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-        assignee: discord.PermissionOverwrite(read_messages=True, send_messages=True)
     }
+    for member in members:
+        overwrites[member] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+        
     cat = interaction.channel.category
     new_ch = await guild.create_text_channel(name=f"📝-{title}", category=cat, overwrites=overwrites)
-    await new_ch.send(f"{assignee.mention} 新しいタスク「{title}」が割り当てられました！\n進捗が変わったら `/status` コマンドで状態を更新してください。", silent=True)
+    
+    mentions_str = " ".join(m.mention for m in members)
+    await new_ch.send(f"{mentions_str} 新しいタスク「{title}」が割り当てられました！\n進捗が変わったら `/status` コマンドで状態を更新してください。", silent=True)
     await interaction.followup.send(f"タスクチャンネル {new_ch.mention} を作成しました。", silent=True)
 
 @client.tree.command(name="status", description="タスクチャンネルの進捗ステータスを更新します")
