@@ -1049,7 +1049,7 @@ async def create_task(interaction: discord.Interaction, assignees: str, title: s
         await interaction.response.send_message("このコマンドを実行する権限がありません。", ephemeral=True, silent=True)
         return
         
-    await interaction.response.defer(ephemeral=False)
+    await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
     
     import re
@@ -1082,7 +1082,7 @@ async def create_task(interaction: discord.Interaction, assignees: str, title: s
     new_ch = await guild.create_text_channel(name=f"📝-{title}", category=cat, overwrites=overwrites)
     
     mentions_str = " ".join(m.mention for m in members)
-    await new_ch.send(f"{mentions_str} 新しいタスク「{title}」が割り当てられました！\n進捗が変わったら `/status` コマンドで状態を更新してください。", silent=True, allowed_mentions=discord.AllowedMentions.none())
+    await new_ch.send(f"@silent {mentions_str} 新しいタスク「{title}」が割り当てられました！\n進捗が変わったら `/status` コマンドで状態を更新してください。", silent=True)
     await interaction.followup.send(f"タスクチャンネル {new_ch.mention} を作成しました。", silent=True)
 
 @client.tree.command(name="status", description="タスクチャンネルの進捗ステータスを更新します")
