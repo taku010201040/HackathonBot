@@ -981,7 +981,7 @@ async def on_reaction_add(reaction, user):
                 else:
                     level_ch = await guild.create_text_channel(name="🏆｜レベル・通知")
             
-            await level_ch.send(f"🎉 {target_user.mention} がレベルアップしました！ (Lv.{new_level}) 🚀", silent=True)
+            await level_ch.send(f"🎉 {target_user.mention} がレベルアップしました！ (Lv.{new_level}) 🚀", silent=True, allowed_mentions=discord.AllowedMentions.none())
         except Exception as e:
             print(f"Level notification error: {e}")
 
@@ -1082,7 +1082,7 @@ async def create_task(interaction: discord.Interaction, assignees: str, title: s
     new_ch = await guild.create_text_channel(name=f"📝-{title}", category=cat, overwrites=overwrites)
     
     mentions_str = " ".join(m.mention for m in members)
-    await new_ch.send(f"{mentions_str} 新しいタスク「{title}」が割り当てられました！\n進捗が変わったら `/status` コマンドで状態を更新してください。", silent=True)
+    await new_ch.send(f"{mentions_str} 新しいタスク「{title}」が割り当てられました！\n進捗が変わったら `/status` コマンドで状態を更新してください。", silent=True, allowed_mentions=discord.AllowedMentions.none())
     await interaction.followup.send(f"タスクチャンネル {new_ch.mention} を作成しました。", silent=True)
 
 @client.tree.command(name="status", description="タスクチャンネルの進捗ステータスを更新します")
