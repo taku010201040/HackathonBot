@@ -1021,6 +1021,10 @@ async def on_message(message: discord.Message):
             answer = await ask_gemini(prompt)
             await message.reply(answer, silent=True)
 
+    # スレッドやダイレクトメッセージなど、通常のテキストチャンネル以外はスキップ
+    if not isinstance(message.channel, discord.TextChannel):
+        return
+
     template_text = _match_template(getattr(message.channel, 'name', ''))
     if not template_text:
         return
