@@ -1014,10 +1014,11 @@ async def on_message(message: discord.Message):
 
     if message.author.bot:
         return
-    # AI技術サポート
-    if "技術サポート" in ch_name and client.user.mentioned_in(message):
+    # AI技術サポート/チャット (DMまたはメンションされた場合)
+    is_dm = isinstance(message.channel, discord.DMChannel)
+    if is_dm or client.user.mentioned_in(message):
         async with message.channel.typing():
-            prompt = message.content.replace(f'<@{client.user.id}>', '').strip()
+            prompt = message.content.replace(f'<@{client.user.id}>', '').replace(f'<@!{client.user.id}>', '').strip()
             answer = await ask_gemini(prompt)
             await message.reply(answer, silent=True)
 
