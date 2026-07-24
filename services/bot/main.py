@@ -440,18 +440,24 @@ class MyClient(discord.Client):
     async def schedule_loop(self):
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        jst = datetime.timezone(datetime.timedelta(hours=9))
+        now_str = datetime.datetime.now(jst).strftime("%Y-%m-%d %H:%M")
         c.execute("SELECT id, channel_id, message FROM schedules WHERE send_at <= ?", (now_str,))
         rows = c.fetchall()
         for r in rows:
             sid, ch_id, msg = r
             ch = self.get_channel(ch_id)
+            if not ch:
+                try:
+                    ch = await self.fetch_channel(ch_id)
+                except Exception as e:
+                    print(f"Could not fetch channel {ch_id} for schedule {sid}: {e}")
             if ch:
                 try:
                     await ch.send(msg, silent=True)
-                except:
-                    pass
-            c.execute("DELETE FROM schedules WHERE id = ?", (sid,))
+                    c.execute("DELETE FROM schedules WHERE id = ?", (sid,))
+                except Exception as e:
+                    print(f"Failed to send schedule {sid}: {e}")
         conn.commit()
         conn.close()
 
