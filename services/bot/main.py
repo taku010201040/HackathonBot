@@ -282,6 +282,111 @@ class SkillsToolsView(discord.ui.View):
             ]
         ))
 
+class ScheduleEditModal(discord.ui.Modal, title="📅 予約メッセージの編集"):
+    def __init__(self, schedule_id: int, current_send_at: str, current_message: str):
+        super().__init__()
+        self.schedule_id = schedule_id
+        
+        self.send_at_input = discord.ui.TextInput(
+            label="送信日時 (YYYY-MM-DD HH:MM)",
+            default=current_send_at,
+            max_length=16,
+            required=True
+        )
+        self.message_input = discord.ui.TextInput(
+            label="送信メッセージ内容",
+            style=discord.TextStyle.paragraph,
+            default=current_message,
+            required=True
+        )
+        self.add_item(self.send_at_input)
+        self.add_item(self.message_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        send_at_str = self.send_at_input.value.strip()
+        new_msg = self.message_input.value.strip()
+        
+        try:
+            datetime.datetime.strptime(send_at_str, "%Y-%m-%d %H:%M")
+        except ValueError:
+            await interaction.followup.send("エラー: 日時のフォーマットが正しくありません。例: 2026-07-30 18:00", ephemeral=True, silent=True)
+            return
+
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE schedules SET send_at = ?, message = ? WHERE id = ?", (send_at_str, new_msg, self.schedule_id))
+        conn.commit()
+        conn.close()
+        
+        await interaction.followup.send(f"✅ 予約メッセージ（ID: {self.schedule_id}）を更新しました！\n• 予約日時: `{send_at_str}`", ephemeral=True, silent=True)
+
+class ScheduleActionView(discord.ui.View):
+    def __init__(self, schedule_id: int, send_at: str, message: str):
+        super().__init__(timeout=180)
+        self.schedule_id = schedule_id
+        self.send_at = send_at
+        self.message = message
+
+    @discord.ui.button(label="✏️ 予約を編集", style=discord.ButtonStyle.primary)
+    async def edit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = ScheduleEditModal(self.schedule_id, self.send_at, self.message)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="🗑️ 予約を削除", style=discord.ButtonStyle.danger)
+    async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("DELETE FROM schedules WHERE id = ?", (self.schedule_id,))
+        conn.commit()
+        conn.close()
+        
+        button.disabled = True
+        button.label = "削除済み"
+        await interaction.response.edit_message(content=f"🗑️ 予約メッセージ（ID: {self.schedule_id}）を取り消し・削除しました。", embed=None, view=None)
+
+class ScheduleSelectDropdown(discord.ui.Select):
+    def __init__(self, schedules_data):
+        options = []
+        for sid, ch_id, send_at, msg in schedules_data[:25]:
+            label = f"ID:{sid} [{send_at}]"
+            desc = msg[:45] + ("..." if len(msg) > 45 else "")
+            options.append(discord.SelectOption(label=label, value=str(sid), description=desc))
+            
+        super().__init__(placeholder="▼ 編集・削除する予約を選択してください", options=options, custom_id="select_schedule")
+
+    async def callback(self, interaction: discord.Interaction):
+        sid = int(self.values[0])
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT id, channel_id, send_at, message FROM schedules WHERE id = ?", (sid,))
+        row = c.fetchone()
+        conn.close()
+        
+        if not row:
+            await interaction.response.send_message("指定された予約メッセージは見つかりませんでした（既に送信された可能性があります）。", ephemeral=True, silent=True)
+            return
+
+        sid, ch_id, send_at, msg = row
+        ch = interaction.guild.get_channel(ch_id)
+        ch_name = ch.mention if ch else f"ID: {ch_id}"
+        
+        embed = discord.Embed(
+            title=f"📅 予約メッセージ詳細 (ID: {sid})",
+            color=0x5865F2
+        )
+        embed.add_field(name="📌 送信先チャンネル", value=ch_name, inline=True)
+        embed.add_field(name="⏰ 送信予定日時", value=f"`{send_at}`", inline=True)
+        embed.add_field(name="📝 メッセージ内容", value=f"```\n{msg}\n```", inline=False)
+        
+        view = ScheduleActionView(sid, send_at, msg)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True, silent=True)
+
+class ScheduleManageView(discord.ui.View):
+    def __init__(self, schedules_data):
+        super().__init__(timeout=180)
+        self.add_item(ScheduleSelectDropdown(schedules_data))
+
 class MyClient(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
@@ -375,6 +480,10 @@ class MyClient(discord.Client):
             role_row = c.fetchone()
             c.execute("SELECT value FROM settings WHERE key='event_reminder_template'")
             tpl_row = c.fetchone()
+            c.execute("SELECT value FROM settings WHERE key='event_reminder_minutes_before'")
+            minutes_row = c.fetchone()
+            target_minutes = int(minutes_row[0]) if minutes_row else 60
+            target_seconds = target_minutes * 60
 
             for event in events:
                 if event.status != discord.EventStatus.scheduled:
@@ -383,7 +492,7 @@ class MyClient(discord.Client):
                 diff = event.start_time - now
                 diff_seconds = diff.total_seconds()
 
-                if 0 <= diff_seconds <= 3600:
+                if 0 <= diff_seconds <= target_seconds:
                     c.execute("SELECT 1 FROM event_reminders WHERE event_id = ?", (str(event.id),))
                     if c.fetchone() is None:
                         announce_ch = None
@@ -430,7 +539,7 @@ class MyClient(discord.Client):
                                     msg = f"{mention_str}\n{msg}"
                             else:
                                 msg = (
-                                    f"{mention_str} 📢 **イベント開催1時間前リマインド**\n\n"
+                                    f"{mention_str} 📢 **イベント開催{target_minutes}分前リマインド**\n\n"
                                     f"イベント「**{event.name}**」がまもなく開始されます！\n\n"
                                     f"📅 **開始時刻**: {time_str}\n"
                                     f"📍 **場所**: {location_str}\n"
@@ -1361,13 +1470,15 @@ async def list_events(interaction: discord.Interaction):
 @app_commands.describe(
     channel="リマインドを送信するテキストチャンネル",
     role="メンションするロール（指定しない場合は @everyone または 参加者）",
-    template="文面。プレースホルダー: {name}, {time}, {location}, {url}, {role}"
+    template="文面。プレースホルダー: {name}, {time}, {location}, {url}, {role}",
+    minutes_before="何分前に通知を送るか (例: 60 で1時間前、30 で30分前、120 で2時間前)"
 )
 async def setup_event_reminder(
     interaction: discord.Interaction, 
     channel: discord.TextChannel = None, 
     role: discord.Role = None, 
-    template: str = None
+    template: str = None,
+    minutes_before: int = None
 ):
     await interaction.response.defer(ephemeral=True)
     conn = sqlite3.connect(DB_PATH)
@@ -1383,6 +1494,13 @@ async def setup_event_reminder(
     if template:
         c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('event_reminder_template', ?)", (template,))
         updated.append(f"• **テンプレート文面**:\n```\n{template}\n```")
+    if minutes_before is not None:
+        if minutes_before <= 0:
+            await interaction.followup.send("エラー: minutes_before は正の整数を指定してください。", ephemeral=True, silent=True)
+            conn.close()
+            return
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('event_reminder_minutes_before', ?)", (str(minutes_before),))
+        updated.append(f"• **通知タイミング**: イベント開始の **{minutes_before} 分前**")
         
     conn.commit()
     conn.close()
@@ -1415,10 +1533,27 @@ async def cancel_event_reminder(interaction: discord.Interaction, action: app_co
         conn.close()
         await interaction.followup.send("▶️ **イベント自動リマインダーを再開（有効化）しました。**", ephemeral=True, silent=True)
     elif action.value == "reset":
-        c.execute("DELETE FROM settings WHERE key IN ('event_reminder_channel_id', 'event_reminder_role_id', 'event_reminder_template', 'event_reminder_enabled')")
+        c.execute("DELETE FROM settings WHERE key IN ('event_reminder_channel_id', 'event_reminder_role_id', 'event_reminder_template', 'event_reminder_enabled', 'event_reminder_minutes_before')")
         conn.commit()
         conn.close()
-        await interaction.followup.send("🔄 **イベントリマインダーの設定（通知先・ロール・テンプレート）を初期状態にリセットしました。**", ephemeral=True, silent=True)
+        await interaction.followup.send("🔄 **イベントリマインダーの設定（通知先・ロール・テンプレート・タイマー）を初期状態にリセットしました。**", ephemeral=True, silent=True)
+
+@client.tree.command(name="schedules", description="【運営用】現在登録されている予約送信メッセージの一覧取得・編集・削除を行います")
+@app_commands.default_permissions(administrator=True)
+async def list_schedules(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, channel_id, send_at, message FROM schedules ORDER BY send_at ASC")
+    rows = c.fetchall()
+    conn.close()
+    
+    if not rows:
+        await interaction.followup.send("現在登録されている予約メッセージはありません。", ephemeral=True, silent=True)
+        return
+        
+    view = ScheduleManageView(rows)
+    await interaction.followup.send(f"📅 **現在登録されている予約メッセージ ({len(rows)}件):**\n下記ドロップダウンから選択して編集・削除が行えます。", view=view, ephemeral=True, silent=True)
 
 
 def run_health_check_server():
