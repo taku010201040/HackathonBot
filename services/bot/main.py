@@ -21,6 +21,7 @@ def init_db():
     c.execute('CREATE TABLE IF NOT EXISTS knowledge (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id INTEGER, send_at TEXT, message TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
+    c.execute('CREATE TABLE IF NOT EXISTS event_reminders (event_id TEXT PRIMARY KEY, reminded_at TEXT)')
     conn.commit()
     conn.close()
 init_db()
@@ -349,6 +350,94 @@ class MyClient(discord.Client):
         conn.commit()
         conn.close()
 
+    @tasks.loop(minutes=1)
+    async def event_reminder_loop(self):
+        if not GUILD_ID: return
+        guild = self.get_guild(int(GUILD_ID))
+        if not guild: return
+
+        try:
+            events = await guild.fetch_scheduled_events()
+            now = datetime.datetime.now(datetime.timezone.utc)
+
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+
+            c.execute("SELECT value FROM settings WHERE key='event_reminder_channel_id'")
+            ch_row = c.fetchone()
+            c.execute("SELECT value FROM settings WHERE key='event_reminder_role_id'")
+            role_row = c.fetchone()
+            c.execute("SELECT value FROM settings WHERE key='event_reminder_template'")
+            tpl_row = c.fetchone()
+
+            for event in events:
+                if event.status != discord.EventStatus.scheduled:
+                    continue
+
+                diff = event.start_time - now
+                diff_seconds = diff.total_seconds()
+
+                if 0 <= diff_seconds <= 3600:
+                    c.execute("SELECT 1 FROM event_reminders WHERE event_id = ?", (str(event.id),))
+                    if c.fetchone() is None:
+                        announce_ch = None
+                        if ch_row:
+                            try:
+                                announce_ch = guild.get_channel(int(ch_row[0]))
+                            except:
+                                pass
+                        if not announce_ch:
+                            announce_ch = discord.utils.get(guild.text_channels, name="📢｜全体アナウンス")
+                        if not announce_ch:
+                            announce_ch = discord.utils.get(guild.text_channels, name="📅｜イベントカレンダー")
+                        if not announce_ch:
+                            announce_ch = discord.utils.find(lambda ch: "アナウンス" in ch.name, guild.text_channels)
+                        if not announce_ch:
+                            announce_ch = guild.system_channel
+
+                        if announce_ch:
+                            mention_str = ""
+                            if role_row:
+                                try:
+                                    role = guild.get_role(int(role_row[0]))
+                                    if role:
+                                        mention_str = role.mention
+                                except:
+                                    pass
+                            if not mention_str:
+                                participant_role = discord.utils.get(guild.roles, name="参加者")
+                                mention_str = participant_role.mention if participant_role else "@everyone"
+
+                            timestamp = int(event.start_time.timestamp())
+                            time_str = f"<t:{timestamp}:F> (<t:{timestamp}:R>)"
+                            location_str = event.location or "Discord内"
+
+                            if tpl_row and tpl_row[0].strip():
+                                template = tpl_row[0]
+                                msg = template.replace("{name}", event.name)\
+                                              .replace("{time}", time_str)\
+                                              .replace("{location}", location_str)\
+                                              .replace("{url}", event.url)
+                                if "{role}" in msg:
+                                    msg = msg.replace("{role}", mention_str)
+                                else:
+                                    msg = f"{mention_str}\n{msg}"
+                            else:
+                                msg = (
+                                    f"{mention_str} 📢 **イベント開催1時間前リマインド**\n\n"
+                                    f"イベント「**{event.name}**」がまもなく開始されます！\n\n"
+                                    f"📅 **開始時刻**: {time_str}\n"
+                                    f"📍 **場所**: {location_str}\n"
+                                    f"🔗 **詳細・参加表明はこちら**: {event.url}"
+                                )
+
+                            await announce_ch.send(msg)
+                            c.execute("INSERT INTO event_reminders (event_id, reminded_at) VALUES (?, ?)", (str(event.id), now.isoformat()))
+                            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Event reminder loop error: {e}")
+
     async def setup_hook(self):
         self.add_view(BasicProfileView())
         self.add_view(SkillsToolsView())
@@ -357,6 +446,7 @@ class MyClient(discord.Client):
         self.add_view(RuleVerifyView())
         self.deadline_loop.start()
         self.schedule_loop.start()
+        self.event_reminder_loop.start()
 
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
@@ -1229,6 +1319,72 @@ async def spawn_sos_button(interaction: discord.Interaction):
     )
     await interaction.channel.send(embed=embed, view=MentorSummonView())
     await interaction.response.send_message("ボタンを設置しました。", ephemeral=True)
+
+@client.tree.command(name="events", description="【運営用】現在登録されているDiscordイベントの一覧を取得・表示します")
+@app_commands.default_permissions(administrator=True)
+async def list_events(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    try:
+        events = await guild.fetch_scheduled_events()
+        if not events:
+            await interaction.followup.send("現在スケジュールされているイベントはありません。", ephemeral=True, silent=True)
+            return
+            
+        embeds = []
+        for event in events:
+            embed = discord.Embed(
+                title=event.name,
+                description=event.description or "（説明なし）",
+                color=0x5865F2,
+                url=event.url
+            )
+            timestamp = int(event.start_time.timestamp())
+            embed.add_field(name="📅 開始時刻", value=f"<t:{timestamp}:F> (<t:{timestamp}:R>)", inline=False)
+            embed.add_field(name="📍 場所", value=event.location or "Discord内", inline=True)
+            embed.add_field(name="👥 参加予定者数", value=f"{event.user_count or 0} 人", inline=True)
+            embed.set_footer(text=f"ステータス: {event.status.name} | ID: {event.id}")
+            embeds.append(embed)
+            
+        await interaction.followup.send(f"📅 **取得したイベント一覧 ({len(events)}件)**:", embeds=embeds[:10], ephemeral=True, silent=True)
+    except Exception as e:
+        await interaction.followup.send(f"イベントの取得中にエラーが発生しました: {e}", ephemeral=True, silent=True)
+
+@client.tree.command(name="setup_event_reminder", description="【運営用】イベント自動リマインダーの通知先・ロール・文面を設定します")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    channel="リマインドを送信するテキストチャンネル",
+    role="メンションするロール（指定しない場合は @everyone または 参加者）",
+    template="文面。プレースホルダー: {name}, {time}, {location}, {url}, {role}"
+)
+async def setup_event_reminder(
+    interaction: discord.Interaction, 
+    channel: discord.TextChannel = None, 
+    role: discord.Role = None, 
+    template: str = None
+):
+    await interaction.response.defer(ephemeral=True)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    updated = []
+    if channel:
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('event_reminder_channel_id', ?)", (str(channel.id),))
+        updated.append(f"• **通知チャンネル**: {channel.mention}")
+    if role:
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('event_reminder_role_id', ?)", (str(role.id),))
+        updated.append(f"• **メンションロール**: {role.mention}")
+    if template:
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('event_reminder_template', ?)", (template,))
+        updated.append(f"• **テンプレート文面**:\n```\n{template}\n```")
+        
+    conn.commit()
+    conn.close()
+    
+    if not updated:
+        await interaction.followup.send("パラメータが指定されていません。設定は変更されていません。", ephemeral=True, silent=True)
+    else:
+        await interaction.followup.send("✅ **イベントリマインダー設定を更新しました：**\n\n" + "\n".join(updated), ephemeral=True, silent=True)
 
 
 def run_health_check_server():
