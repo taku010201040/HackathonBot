@@ -534,7 +534,7 @@ class MyClient(discord.Client):
                             location_str = event.location or "Discord内"
 
                             if tpl_row and tpl_row[0].strip():
-                                template = tpl_row[0]
+                                template = tpl_row[0].replace("\\n", "\n")
                                 msg = template.replace("{name}", event.name)\
                                               .replace("{time}", time_str)\
                                               .replace("{location}", location_str)\
@@ -1499,7 +1499,8 @@ async def setup_event_reminder(
         updated.append(f"• **メンションロール**: {role.mention}")
     if template:
         c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('event_reminder_template', ?)", (template,))
-        updated.append(f"• **テンプレート文面**:\n```\n{template}\n```")
+        display_tpl = template.replace("\\n", "\n")
+        updated.append(f"• **テンプレート文面**:\n```\n{display_tpl}\n```")
     if minutes_before is not None:
         if minutes_before <= 0:
             await interaction.followup.send("エラー: minutes_before は正の整数を指定してください。", ephemeral=True, silent=True)
@@ -1544,22 +1545,78 @@ async def cancel_event_reminder(interaction: discord.Interaction, action: app_co
         conn.close()
         await interaction.followup.send("🔄 **イベントリマインダーの設定（通知先・ロール・テンプレート・タイマー）を初期状態にリセットしました。**", ephemeral=True, silent=True)
 
-@client.tree.command(name="schedules", description="【運営用】現在登録されている予約送信メッセージの一覧取得・編集・削除を行います")
+@client.tree.command(name="schedules", description="【運営用】予約メッセージおよびイベントリマインダー設定の確認・編集を行います")
 @app_commands.default_permissions(administrator=True)
 async def list_schedules(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    
+    # 1. イベントリマインダー設定の取得
+    c.execute("SELECT value FROM settings WHERE key='event_reminder_channel_id'")
+    ch_row = c.fetchone()
+    c.execute("SELECT value FROM settings WHERE key='event_reminder_role_id'")
+    role_row = c.fetchone()
+    c.execute("SELECT value FROM settings WHERE key='event_reminder_template'")
+    tpl_row = c.fetchone()
+    c.execute("SELECT value FROM settings WHERE key='event_reminder_enabled'")
+    enabled_row = c.fetchone()
+    c.execute("SELECT value FROM settings WHERE key='event_reminder_minutes_before'")
+    minutes_row = c.fetchone()
+    
+    guild = interaction.guild
+    
+    # チャンネル表示
+    ch_str = "未指定 (自動判定)"
+    if ch_row:
+        ch = guild.get_channel(int(ch_row[0])) if guild else None
+        if ch:
+            ch_str = ch.mention
+        else:
+            ch_str = f"<#{ch_row[0]}>"
+        
+    # ロール表示
+    role_str = "未指定 (@everyone または 参加者)"
+    if role_row:
+        role = guild.get_role(int(role_row[0])) if guild else None
+        if role:
+            role_str = role.mention
+        else:
+            role_str = f"<@&{role_row[0]}>"
+        
+    # ステータス表示
+    is_enabled = (enabled_row[0] != 'false') if enabled_row else True
+    status_str = "🟢 有効（稼働中）" if is_enabled else "🔴 一時停止中"
+    
+    # タイマー表示
+    minutes_str = f"{minutes_row[0]} 分前" if minutes_row else "60 分前 (1時間前)"
+    
+    # テンプレート表示
+    tpl_str = tpl_row[0].replace("\\n", "\n") if tpl_row else "（デフォルトテンプレート）"
+    
+    embed = discord.Embed(
+        title="⚙️ イベント自動リマインダーの現在の設定",
+        color=0x5865F2 if is_enabled else 0x95A5A6
+    )
+    embed.add_field(name="📊 稼働ステータス", value=status_str, inline=True)
+    embed.add_field(name="⏰ 送信タイマー", value=minutes_str, inline=True)
+    embed.add_field(name="📌 通知チャンネル", value=ch_str, inline=True)
+    embed.add_field(name="👥 メンション対象", value=role_str, inline=True)
+    embed.add_field(name="📝 テンプレート文面", value=f"```\n{tpl_str}\n```", inline=False)
+    
+    # 2. 予約送信メッセージ一覧
     c.execute("SELECT id, channel_id, send_at, message FROM schedules ORDER BY send_at ASC")
     rows = c.fetchall()
     conn.close()
     
-    if not rows:
-        await interaction.followup.send("現在登録されている予約メッセージはありません。", ephemeral=True, silent=True)
-        return
-        
-    view = ScheduleManageView(rows)
-    await interaction.followup.send(f"📅 **現在登録されている予約メッセージ ({len(rows)}件):**\n下記ドロップダウンから選択して編集・削除が行えます。", view=view, ephemeral=True, silent=True)
+    msg_content = "📅 **スケジュール管理パネル**"
+    if rows:
+        msg_content += f"\n\n📨 **個別予約送信メッセージ ({len(rows)}件):**\n下のドロップダウンから選択して修正・削除が行えます。"
+        view = ScheduleManageView(rows)
+        await interaction.followup.send(content=msg_content, embed=embed, view=view, ephemeral=True, silent=True)
+    else:
+        msg_content += "\n\n📨 **個別予約送信メッセージ:** 現在登録されている個別予約メッセージはありません。\n（`/schedule_message` で追加できます）"
+        await interaction.followup.send(content=msg_content, embed=embed, ephemeral=True, silent=True)
 
 
 def run_health_check_server():
