@@ -363,6 +363,12 @@ class MyClient(discord.Client):
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
 
+            c.execute("SELECT value FROM settings WHERE key='event_reminder_enabled'")
+            enabled_row = c.fetchone()
+            if enabled_row and enabled_row[0] == 'false':
+                conn.close()
+                return
+
             c.execute("SELECT value FROM settings WHERE key='event_reminder_channel_id'")
             ch_row = c.fetchone()
             c.execute("SELECT value FROM settings WHERE key='event_reminder_role_id'")
@@ -1385,6 +1391,34 @@ async def setup_event_reminder(
         await interaction.followup.send("パラメータが指定されていません。設定は変更されていません。", ephemeral=True, silent=True)
     else:
         await interaction.followup.send("✅ **イベントリマインダー設定を更新しました：**\n\n" + "\n".join(updated), ephemeral=True, silent=True)
+
+@client.tree.command(name="cancel_event_reminder", description="【運営用】イベント自動リマインダーを一時停止・再開、または設定リセットします")
+@app_commands.default_permissions(administrator=True)
+@app_commands.choices(action=[
+    app_commands.Choice(name="⏸️ 自動リマインダーを一時停止・無効化", value="disable"),
+    app_commands.Choice(name="▶️ 自動リマインダーを再開・有効化", value="enable"),
+    app_commands.Choice(name="🔄 設定（チャンネル・ロール・文面）を初期リセット", value="reset"),
+])
+async def cancel_event_reminder(interaction: discord.Interaction, action: app_commands.Choice[str]):
+    await interaction.response.defer(ephemeral=True)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    if action.value == "disable":
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('event_reminder_enabled', 'false')")
+        conn.commit()
+        conn.close()
+        await interaction.followup.send("⏸️ **イベント自動リマインダーを一時停止（無効化）しました。**\nイベントが開催されても自動リマインドは送信されません。", ephemeral=True, silent=True)
+    elif action.value == "enable":
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('event_reminder_enabled', 'true')")
+        conn.commit()
+        conn.close()
+        await interaction.followup.send("▶️ **イベント自動リマインダーを再開（有効化）しました。**", ephemeral=True, silent=True)
+    elif action.value == "reset":
+        c.execute("DELETE FROM settings WHERE key IN ('event_reminder_channel_id', 'event_reminder_role_id', 'event_reminder_template', 'event_reminder_enabled')")
+        conn.commit()
+        conn.close()
+        await interaction.followup.send("🔄 **イベントリマインダーの設定（通知先・ロール・テンプレート）を初期状態にリセットしました。**", ephemeral=True, silent=True)
 
 
 def run_health_check_server():
