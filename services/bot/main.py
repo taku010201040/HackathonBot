@@ -41,11 +41,36 @@ def get_knowledge_context():
     conn.close()
     return "\n---\n".join([r[0] for r in rows])
 
-async def ask_gemini(prompt: str) -> str:
+def get_server_structure_context(guild: discord.Guild = None) -> str:
+    if not guild:
+        return ""
+    lines = ["【現在のDiscordサーバーの構造・チャンネル・ロール情報】"]
+    lines.append("■ チャンネル一覧 (名前 & ID):")
+    for cat in guild.categories:
+        lines.append(f"・カテゴリ「{cat.name}」")
+        for ch in cat.channels:
+            lines.append(f"  - #{ch.name} (ID: {ch.id})")
+    no_cat = [c for c in guild.channels if c.category is None and not isinstance(c, discord.CategoryChannel)]
+    if no_cat:
+        lines.append("・カテゴリなし:")
+        for ch in no_cat:
+            lines.append(f"  - #{ch.name} (ID: {ch.id})")
+            
+    lines.append("■ ロール一覧 (名前 & ID):")
+    for r in guild.roles:
+        if not r.is_default():
+            lines.append(f"  - @{r.name} (ID: {r.id})")
+            
+    return "\n".join(lines)
+
+async def ask_gemini(prompt: str, guild: discord.Guild = None) -> str:
     if not os.getenv("GEMINI_API_KEY"):
         return "Gemini APIキーが設定されていません。"
     context = get_knowledge_context()
-    system_instruction = f"あなたはハッカソンのサポートAIです。以下のナレッジを参考にして回答してください。\n【ナレッジ】\n{context}"
+    server_struct = get_server_structure_context(guild)
+    
+    full_context = f"{context}\n\n{server_struct}".strip()
+    system_instruction = f"あなたはハッカソンのサポートAIです。以下のナレッジおよびサーバー情報を参考にして回答してください。\n【情報】\n{full_context}"
     try:
         model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=system_instruction, generation_config=generation_config)
         response = model.generate_content(prompt)
@@ -566,6 +591,56 @@ class MyClient(discord.Client):
             except Exception as e:
                 print(f"Event reminder loop error: {e}")
 
+    @tasks.loop(minutes=1)
+    async def ai_news_loop(self):
+        jst = datetime.timezone(datetime.timedelta(hours=9))
+        now_jst = datetime.datetime.now(jst)
+        if now_jst.hour == 8 and now_jst.minute == 0:
+            today_str = now_jst.strftime("%Y-%m-%d")
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT 1 FROM settings WHERE key='ai_news_last_posted_date' AND value=?", (today_str,))
+            if c.fetchone() is not None:
+                conn.close()
+                return
+            c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('ai_news_last_posted_date', ?)", (today_str,))
+            conn.commit()
+            conn.close()
+            
+            if not os.getenv("GEMINI_API_KEY"):
+                return
+
+            news_prompt = (
+                "最新の注目のAI技術トレンド、LLM、生成AIツール、オープンソースモデル、AI業界の話題など、"
+                "エンジニアやハッカソン参加者がワクワクするようなAIニュースを3〜5つ厳選して要約してください。\n"
+                "構成条件:\n"
+                "・各ニュースに絵文字タイトル、概要、注目ポイントを分かりやすくまとめてください。\n"
+                "・日本語で丁寧かつ読みやすいレイアウトで作成してください。"
+            )
+            try:
+                model = genai.GenerativeModel('gemini-1.5-flash', generation_config=generation_config)
+                response = model.generate_content(news_prompt)
+                news_content = response.text
+                
+                target_gids = get_guild_ids()
+                guilds = [self.get_guild(gid) for gid in target_gids if self.get_guild(gid)] if target_gids else self.guilds
+                
+                for guild in guilds:
+                    if not guild: continue
+                    news_ch = discord.utils.get(guild.text_channels, name="📰｜aiテックニュース")
+                    if not news_ch:
+                        news_ch = discord.utils.find(lambda c: "テックニュース" in c.name or "aiニュース" in c.name, guild.text_channels)
+                    if news_ch:
+                        embed = discord.Embed(
+                            title=f"📰 【毎朝のAIニュースダイジェスト】 {now_jst.strftime('%Y年%m月%d日')}",
+                            description=news_content,
+                            color=0x448AFF
+                        )
+                        embed.set_footer(text="🤖 Powered by Gemini AI | 毎朝8時配信")
+                        await news_ch.send(embed=embed, silent=True)
+            except Exception as e:
+                print(f"AI news loop error: {e}")
+
     async def setup_hook(self):
         self.add_view(BasicProfileView())
         self.add_view(SkillsToolsView())
@@ -575,6 +650,7 @@ class MyClient(discord.Client):
         self.deadline_loop.start()
         self.schedule_loop.start()
         self.event_reminder_loop.start()
+        self.ai_news_loop.start()
 
         target_gids = get_guild_ids()
         if target_gids:
@@ -758,7 +834,7 @@ async def setup_onboarding(interaction: discord.Interaction):
         )
         rule_embed1.add_field(
             name="🚫 3. スパム・宣伝の禁止",
-            value="• 無許可の宣伝・勧誘・営業活動は禁止です。\n• 同じ内容の連投、不必要な @everyone / @here の使用はおやめください。\n• 外部サーバーへの招待リンクの無断投稿も禁止です。",
+            value="• 無許可の宣伝・勧誘・営業活動は禁止です。\n• 同じ内容の連投、不必要な `@everyone` や `@here` の使用はおやめください。\n• 外部サーバーへの招待リンクの無断投稿も禁止です。",
             inline=False,
         )
 
@@ -790,9 +866,11 @@ async def setup_onboarding(interaction: discord.Interaction):
             value="• 本サーバーのすべてのユーザーは、[Discord利用規約](https://discord.com/terms) および [コミュニティガイドライン](https://discord.com/guidelines) を遵守する義務があります。\n• 13歳未満の方はDiscordの利用規約に基づきご利用いただけません。",
             inline=False,
         )
+        
+        sos_target = sos_ch.mention if sos_ch else (question_ch.mention if question_ch else '運営への質問')
         rule_embed3.add_field(
             name="🆘 困ったとき・報告したいとき",
-            value=f"• ルール違反を目撃した場合、または自身が被害を受けた場合は、\n　{m(sos_ch, '🆘SOS窓口')} チャンネルまたは運営メンバーへのDMでご連絡ください。\n• 報告者のプライバシーは厳守します。安心してご相談ください。\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 *本ルールは運営の判断により予告なく更新される場合があります。*\n📌 *最終更新: 2026年5月30日*",
+            value=f"• ルール違反を目撃した場合、または自身が被害を受けた場合は、\n　{sos_target} チャンネルまたは運営メンバーへのDMでご連絡ください。\n• 報告者のプライバシーは厳守します。安心してご相談ください。\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n📌 *本ルールは運営の判断により予告なく更新される場合があります。*\n📌 *最終更新: 2026年5月30日*",
             inline=False,
         )
 
@@ -819,9 +897,20 @@ async def setup_onboarding(interaction: discord.Interaction):
             value=f"🔔 {m(announce_ch, '全体アナウンス')} — 最重要の連絡事項（※書き込み不可・閲覧専用）\n📅 {m(calendar_ch, 'イベントカレンダー')} — フェーズごとの日程、〆切リマインド\n🏆 {m(award_ch, '審査・アワード情報')} — 審査基準・賞金・賞品の詳細\n🎁 {m(sponsor_info_ch, '協賛企業からのお知らせ')} — API無料枠・企業賞などの情報",
             inline=False,
         )
+
+        comm_lines = [
+            f"👋 {m(intro_ch, '自己紹介')} — 挨拶をして他のメンバーに自分を知ってもらおう！",
+            f"☕ {m(lounge_ch, '雑談ラウンジ')} — テーマ自由のフリートーク（息抜きに最適）",
+            f"📰 {m(news_ai_ch, 'aiテックニュース')} — 最新のAI動向や使えそうなツールの共有",
+            f"📰 {m(news_youth_ch, '若手ニュース')} — 若手向けの有益な情報",
+            f"📚 {m(resource_ch, 'リソース共有')} — 便利な記事・テンプレートの共有",
+        ]
+        if photo_ch:
+            comm_lines.append(f"📸 {photo_ch.mention} — 開発中の画面やイベントの思い出")
+
         guide_embed1.add_field(
             name="💬 COMMUNITY & NETWORKING — 仲間をつくろう",
-            value=f"👋 {m(intro_ch, '自己紹介')} — 挨拶をして他のメンバーに自分を知ってもらおう！\n☕ {m(lounge_ch, '雑談ラウンジ')} — テーマ自由のフリートーク（息抜きに最適）\n📰 {m(news_ai_ch, 'aiテックニュース')} — 最新のAI動向や使えそうなツールの共有\n📰 {m(news_youth_ch, '若手ニュース')} — 若手向けの有益な情報\n📚 {m(resource_ch, 'リソース共有')} — 便利な記事・テンプレートの共有\n📸 {m(photo_ch, '写真・スクショ共有')} — 開発中の画面やイベントの思い出",
+            value="\n".join(comm_lines),
             inline=False,
         )
 
@@ -831,9 +920,18 @@ async def setup_onboarding(interaction: discord.Interaction):
             value=f"🤝 {m(recruit_ch, 'メンバー募集')} — 「エンジニア求む！」の募集投稿\n🙋‍♀️ {m(join_ch, 'チーム加入希望')} — 「こんなスキルあります！」のアピール投稿\n💡 {m(idea_ch, 'アイデア共有・壁打ち')} — アイデアを投げてフィードバックをもらう\n\n💡 **ヒント**: 募集チャンネル等で発言すると、Botがフォーマットを自動で案内してくれます！",
             inline=False,
         )
+
+        support_lines = [
+            f"❓ {m(question_ch, '運営への質問')} — 日程・ルールに関する一般的な質問",
+            f"🛠️ {m(tech_ai_ch, '技術サポート_ai')} — ChatGPT/Claude等のAPI連携やプロンプトの相談",
+            f"🛠️ {m(tech_nocode_ch, '技術サポート_ノーコード')} — Make, Bubble, Glide等の使い方の質問",
+        ]
+        if sos_ch:
+            support_lines.append(f"🆘 {sos_ch.mention} — 緊急トラブル（チームとの連絡不通・機材故障等）")
+
         guide_embed2.add_field(
             name="❓ SUPPORT & HELPDESK — 困ったらここ",
-            value=f"❓ {m(question_ch, '運営への質問')} — 日程・ルールに関する一般的な質問\n🛠️ {m(tech_ai_ch, '技術サポート_ai')} — ChatGPT/Claude等のAPI連携やプロンプトの相談\n🛠️ {m(tech_nocode_ch, '技術サポート_ノーコード')} — Make, Bubble, Glide等の使い方の質問\n🆘 {m(sos_ch, 'SOS窓口')} — 緊急トラブル（チームとの連絡不通・機材故障等）",
+            value="\n".join(support_lines),
             inline=False,
         )
         guide_embed2.add_field(
@@ -1059,6 +1157,75 @@ async def setup_permissions(interaction: discord.Interaction):
 
     await interaction.followup.send("✅ 権限のセットアップが完了しました！（未同意者向けの非表示設定も適用されました）", silent=True)
 
+@client.tree.command(name="server_info", description="【運営用】現在の全チャンネル・ロール一覧とID・権限状況を取得表示します")
+@app_commands.default_permissions(administrator=True)
+async def inspect_server(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send("エラー: サーバー内で実行してください。", ephemeral=True, silent=True)
+        return
+
+    categories = guild.categories
+    text_channels = guild.text_channels
+    voice_channels = guild.voice_channels
+    
+    ch_summary = []
+    for cat in categories:
+        ch_summary.append(f"📁 **{cat.name}** (ID: `{cat.id}`)")
+        for ch in cat.channels:
+            type_icon = "💬" if isinstance(ch, discord.TextChannel) else ("🔊" if isinstance(ch, discord.VoiceChannel) else "📢")
+            ch_summary.append(f"  └ {type_icon} {ch.name} (ID: `{ch.id}`)")
+            
+    no_cat = [c for c in guild.channels if c.category is None and not isinstance(c, discord.CategoryChannel)]
+    if no_cat:
+        ch_summary.append("📂 **(カテゴリなし)**")
+        for ch in no_cat:
+            type_icon = "💬" if isinstance(ch, discord.TextChannel) else ("🔊" if isinstance(ch, discord.VoiceChannel) else "📢")
+            ch_summary.append(f"  └ {type_icon} {ch.name} (ID: `{ch.id}`)")
+
+    roles = guild.roles
+    role_summary = []
+    for r in sorted(roles, key=lambda x: x.position, reverse=True):
+        if r.is_default():
+            role_summary.append(f"👥 **{r.name}** (ID: `{r.id}`) - @everyone")
+        else:
+            perms = []
+            if r.permissions.administrator: perms.append("管理者")
+            if r.permissions.manage_channels: perms.append("チャンネル管理")
+            if r.permissions.manage_roles: perms.append("ロール管理")
+            if r.permissions.mention_everyone: perms.append("全体メンション可")
+            perm_str = f" [{', '.join(perms)}]" if perms else ""
+            role_summary.append(f"🎖️ {r.name} (ID: `{r.id}`){perm_str}")
+
+    embed1 = discord.Embed(
+        title=f"📊 サーバー設定状況: {guild.name}",
+        description=f"• **サーバーID**: `{guild.id}`\n• **メンバー数**: {guild.member_count} 人\n• **チャンネル総数**: {len(guild.channels)} (テキスト: {len(text_channels)}, VC: {len(voice_channels)})\n• **ロール総数**: {len(roles)} 個",
+        color=0x5865F2
+    )
+
+    ch_text = "\n".join(ch_summary)
+    if len(ch_text) > 3900:
+        ch_text = ch_text[:3900] + "\n... (以下省略)"
+        
+    embed2 = discord.Embed(
+        title="📺 チャンネル一覧 & IDマップ",
+        description=ch_text or "チャンネルはありません",
+        color=0x448AFF
+    )
+
+    role_text = "\n".join(role_summary)
+    if len(role_text) > 3900:
+        role_text = role_text[:3900] + "\n... (以下省略)"
+
+    embed3 = discord.Embed(
+        title="🎖️ ロール一覧 & 主要権限",
+        description=role_text or "ロールはありません",
+        color=0x00E676
+    )
+
+    await interaction.followup.send(embeds=[embed1, embed2, embed3], ephemeral=True, silent=True)
+
 @client.tree.command(name="create_missing_roles", description="不足しているロールをすべて作成します")
 @app_commands.default_permissions(administrator=True)
 async def create_missing_roles(interaction: discord.Interaction):
@@ -1243,7 +1410,7 @@ async def on_message(message: discord.Message):
     if is_dm or client.user.mentioned_in(message):
         async with message.channel.typing():
             prompt = message.content.replace(f'<@{client.user.id}>', '').replace(f'<@!{client.user.id}>', '').strip()
-            answer = await ask_gemini(prompt)
+            answer = await ask_gemini(prompt, guild=message.guild)
             await message.reply(answer, silent=True)
 
     # スレッドやダイレクトメッセージなど、通常のテキストチャンネル以外はスキップ
