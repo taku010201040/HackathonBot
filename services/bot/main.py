@@ -12,6 +12,7 @@ import datetime
 from discord.ext import tasks
 import google.generativeai as genai
 import asyncio
+import re
 
 DB_PATH = "bot_data.db"
 def init_db():
@@ -57,6 +58,10 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '..', '..', '.env'))
 
 TOKEN = os.getenv('DISCORD_TOKEN')
 GUILD_ID = os.getenv('DISCORD_SERVER_ID')
+
+def get_guild_ids():
+    raw = os.getenv('DISCORD_SERVER_ID') or os.getenv('DISCORD_SERVER_IDS') or ""
+    return [int(gid.strip()) for gid in re.split(r'[,;\s]+', raw) if gid.strip().isdigit()]
 
 class RoleDropdown(discord.ui.Select):
     def __init__(self, placeholder: str, options: list[discord.SelectOption], min_values=0, max_values=1, custom_id=None, row=None):
@@ -397,44 +402,45 @@ class MyClient(discord.Client):
     
     @tasks.loop(minutes=60)
     async def deadline_loop(self):
-        if not GUILD_ID: return
-        guild = self.get_guild(int(GUILD_ID))
-        if not guild: return
+        target_gids = get_guild_ids()
+        guilds = [self.get_guild(gid) for gid in target_gids if self.get_guild(gid)] if target_gids else self.guilds
+        if not guilds: return
         
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT value FROM settings WHERE key='deadline'")
-        row = c.fetchone()
-        conn.close()
-        
-        if row:
-            try:
-                deadline = datetime.datetime.fromisoformat(row[0])
-                now = datetime.datetime.now()
-                diff = deadline - now
-                hours = int(diff.total_seconds() // 3600)
-                
-                ch = discord.utils.find(lambda c: "⏳｜" in c.name, guild.voice_channels)
-                if hours >= 0:
-                    new_name = f"⏳｜残り {hours}時間"
-                else:
-                    new_name = "⏳｜ハッカソン終了！"
+        for guild in guilds:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT value FROM settings WHERE key='deadline'")
+            row = c.fetchone()
+            conn.close()
+            
+            if row:
+                try:
+                    deadline = datetime.datetime.fromisoformat(row[0])
+                    now = datetime.datetime.now()
+                    diff = deadline - now
+                    hours = int(diff.total_seconds() // 3600)
                     
-                if ch and ch.name != new_name:
-                    await ch.edit(name=new_name)
-                elif not ch:
-                    # Create one at the top
-                    await guild.create_voice_channel(name=new_name, position=0)
-            except Exception as e:
-                print(f"Deadline loop error: {e}")
-        else:
-            try:
-                # 提出期限が設定されていない場合は、残っているカウントダウン用VCを自動で削除
-                for ch in guild.voice_channels:
-                    if "⏳｜" in ch.name:
-                        await ch.delete()
-            except Exception as e:
-                print(f"Deadline loop cleanup error: {e}")
+                    ch = discord.utils.find(lambda c: "⏳｜" in c.name, guild.voice_channels)
+                    if hours >= 0:
+                        new_name = f"⏳｜残り {hours}時間"
+                    else:
+                        new_name = "⏳｜ハッカソン終了！"
+                        
+                    if ch and ch.name != new_name:
+                        await ch.edit(name=new_name)
+                    elif not ch:
+                        # Create one at the top
+                        await guild.create_voice_channel(name=new_name, position=0)
+                except Exception as e:
+                    print(f"Deadline loop error: {e}")
+            else:
+                try:
+                    # 提出期限が設定されていない場合は、残っているカウントダウン用VCを自動で削除
+                    for ch in guild.voice_channels:
+                        if "⏳｜" in ch.name:
+                            await ch.delete()
+                except Exception as e:
+                    print(f"Deadline loop cleanup error: {e}")
 
     @tasks.loop(minutes=1)
     async def schedule_loop(self):
@@ -463,101 +469,102 @@ class MyClient(discord.Client):
 
     @tasks.loop(minutes=1)
     async def event_reminder_loop(self):
-        if not GUILD_ID: return
-        guild = self.get_guild(int(GUILD_ID))
-        if not guild: return
+        target_gids = get_guild_ids()
+        guilds = [self.get_guild(gid) for gid in target_gids if self.get_guild(gid)] if target_gids else self.guilds
+        if not guilds: return
 
-        try:
-            events = await guild.fetch_scheduled_events()
-            now = datetime.datetime.now(datetime.timezone.utc)
+        for guild in guilds:
+            try:
+                events = await guild.fetch_scheduled_events()
+                now = datetime.datetime.now(datetime.timezone.utc)
 
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
 
-            c.execute("SELECT value FROM settings WHERE key='event_reminder_enabled'")
-            enabled_row = c.fetchone()
-            if enabled_row and enabled_row[0] == 'false':
-                conn.close()
-                return
-
-            c.execute("SELECT value FROM settings WHERE key='event_reminder_channel_id'")
-            ch_row = c.fetchone()
-            c.execute("SELECT value FROM settings WHERE key='event_reminder_role_id'")
-            role_row = c.fetchone()
-            c.execute("SELECT value FROM settings WHERE key='event_reminder_template'")
-            tpl_row = c.fetchone()
-            c.execute("SELECT value FROM settings WHERE key='event_reminder_minutes_before'")
-            minutes_row = c.fetchone()
-            target_minutes = int(minutes_row[0]) if minutes_row else 60
-            target_seconds = target_minutes * 60
-
-            for event in events:
-                if event.status != discord.EventStatus.scheduled:
+                c.execute("SELECT value FROM settings WHERE key='event_reminder_enabled'")
+                enabled_row = c.fetchone()
+                if enabled_row and enabled_row[0] == 'false':
+                    conn.close()
                     continue
 
-                diff = event.start_time - now
-                diff_seconds = diff.total_seconds()
+                c.execute("SELECT value FROM settings WHERE key='event_reminder_channel_id'")
+                ch_row = c.fetchone()
+                c.execute("SELECT value FROM settings WHERE key='event_reminder_role_id'")
+                role_row = c.fetchone()
+                c.execute("SELECT value FROM settings WHERE key='event_reminder_template'")
+                tpl_row = c.fetchone()
+                c.execute("SELECT value FROM settings WHERE key='event_reminder_minutes_before'")
+                minutes_row = c.fetchone()
+                target_minutes = int(minutes_row[0]) if minutes_row else 60
+                target_seconds = target_minutes * 60
 
-                if 0 <= diff_seconds <= target_seconds:
-                    c.execute("SELECT 1 FROM event_reminders WHERE event_id = ?", (str(event.id),))
-                    if c.fetchone() is None:
-                        announce_ch = None
-                        if ch_row:
-                            try:
-                                announce_ch = guild.get_channel(int(ch_row[0]))
-                            except:
-                                pass
-                        if not announce_ch:
-                            announce_ch = discord.utils.get(guild.text_channels, name="📢｜全体アナウンス")
-                        if not announce_ch:
-                            announce_ch = discord.utils.get(guild.text_channels, name="📅｜イベントカレンダー")
-                        if not announce_ch:
-                            announce_ch = discord.utils.find(lambda ch: "アナウンス" in ch.name, guild.text_channels)
-                        if not announce_ch:
-                            announce_ch = guild.system_channel
+                for event in events:
+                    if event.status != discord.EventStatus.scheduled:
+                        continue
 
-                        if announce_ch:
-                            mention_str = ""
-                            if role_row:
+                    diff = event.start_time - now
+                    diff_seconds = diff.total_seconds()
+
+                    if 0 <= diff_seconds <= target_seconds:
+                        c.execute("SELECT 1 FROM event_reminders WHERE event_id = ?", (str(event.id),))
+                        if c.fetchone() is None:
+                            announce_ch = None
+                            if ch_row:
                                 try:
-                                    role = guild.get_role(int(role_row[0]))
-                                    if role:
-                                        mention_str = role.mention
+                                    announce_ch = guild.get_channel(int(ch_row[0]))
                                 except:
                                     pass
-                            if not mention_str:
-                                participant_role = discord.utils.get(guild.roles, name="参加者")
-                                mention_str = participant_role.mention if participant_role else "@everyone"
+                            if not announce_ch:
+                                announce_ch = discord.utils.get(guild.text_channels, name="📢｜全体アナウンス")
+                            if not announce_ch:
+                                announce_ch = discord.utils.get(guild.text_channels, name="📅｜イベントカレンダー")
+                            if not announce_ch:
+                                announce_ch = discord.utils.find(lambda ch: "アナウンス" in ch.name, guild.text_channels)
+                            if not announce_ch:
+                                announce_ch = guild.system_channel
 
-                            timestamp = int(event.start_time.timestamp())
-                            time_str = f"<t:{timestamp}:F> (<t:{timestamp}:R>)"
-                            location_str = event.location or "Discord内"
+                            if announce_ch:
+                                mention_str = ""
+                                if role_row:
+                                    try:
+                                        role = guild.get_role(int(role_row[0]))
+                                        if role:
+                                            mention_str = role.mention
+                                    except:
+                                        pass
+                                if not mention_str:
+                                    participant_role = discord.utils.get(guild.roles, name="参加者")
+                                    mention_str = participant_role.mention if participant_role else "@everyone"
 
-                            if tpl_row and tpl_row[0].strip():
-                                template = tpl_row[0].replace("\\n", "\n")
-                                msg = template.replace("{name}", event.name)\
-                                              .replace("{time}", time_str)\
-                                              .replace("{location}", location_str)\
-                                              .replace("{url}", event.url)
-                                if "{role}" in msg:
-                                    msg = msg.replace("{role}", mention_str)
+                                timestamp = int(event.start_time.timestamp())
+                                time_str = f"<t:{timestamp}:F> (<t:{timestamp}:R>)"
+                                location_str = event.location or "Discord内"
+
+                                if tpl_row and tpl_row[0].strip():
+                                    template = tpl_row[0].replace("\\n", "\n")
+                                    msg = template.replace("{name}", event.name)\
+                                                  .replace("{time}", time_str)\
+                                                  .replace("{location}", location_str)\
+                                                  .replace("{url}", event.url)
+                                    if "{role}" in msg:
+                                        msg = msg.replace("{role}", mention_str)
+                                    else:
+                                        msg = f"{mention_str}\n{msg}"
                                 else:
-                                    msg = f"{mention_str}\n{msg}"
-                            else:
-                                msg = (
-                                    f"{mention_str} 📢 **イベント開催{target_minutes}分前リマインド**\n\n"
-                                    f"イベント「**{event.name}**」がまもなく開始されます！\n\n"
-                                    f"📅 **開始時刻**: {time_str}\n"
-                                    f"📍 **場所**: {location_str}\n"
-                                    f"🔗 **詳細・参加表明はこちら**: {event.url}"
-                                )
+                                    msg = (
+                                        f"{mention_str} 📢 **イベント開催{target_minutes}分前リマインド**\n\n"
+                                        f"イベント「**{event.name}**」がまもなく開始されます！\n\n"
+                                        f"📅 **開始時刻**: {time_str}\n"
+                                        f"📍 **場所**: {location_str}\n"
+                                        f"🔗 **詳細・参加表明はこちら**: {event.url}"
+                                    )
 
-                            await announce_ch.send(msg)
-                            c.execute("INSERT INTO event_reminders (event_id, reminded_at) VALUES (?, ?)", (str(event.id), now.isoformat()))
-                            conn.commit()
-            conn.close()
-        except Exception as e:
-            print(f"Event reminder loop error: {e}")
+                                await announce_ch.send(msg)
+                                c.execute("INSERT INTO event_reminders (event_id, reminded_at) VALUES (?, ?)", (str(event.id), now.isoformat()))
+                                conn.commit()
+                conn.close()
+            except Exception as e:
+                print(f"Event reminder loop error: {e}")
 
     async def setup_hook(self):
         self.add_view(BasicProfileView())
@@ -569,10 +576,16 @@ class MyClient(discord.Client):
         self.schedule_loop.start()
         self.event_reminder_loop.start()
 
-        if GUILD_ID:
-            guild = discord.Object(id=GUILD_ID)
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
+        target_gids = get_guild_ids()
+        if target_gids:
+            for gid in target_gids:
+                try:
+                    guild = discord.Object(id=gid)
+                    self.tree.copy_global_to(guild=guild)
+                    synced = await self.tree.sync(guild=guild)
+                    print(f"サーバー (ID: {gid}) に {len(synced)} 個のコマンドを即時同期しました。")
+                except Exception as e:
+                    print(f"サーバー (ID: {gid}) への同期エラー: {e}")
         else:
             await self.tree.sync()
 
