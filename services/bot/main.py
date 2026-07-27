@@ -13,6 +13,7 @@ from discord.ext import tasks
 import google.generativeai as genai
 import asyncio
 import re
+from typing import Optional
 
 DB_PATH = "bot_data.db"
 def init_db():
@@ -312,6 +313,42 @@ class SkillsToolsView(discord.ui.View):
             ]
         ))
 
+class ScheduleCreateModal(discord.ui.Modal, title="📅 メッセージ予約送信作成"):
+    def __init__(self, send_at: str, channel: discord.TextChannel, mention_prefix: str = ""):
+        super().__init__()
+        self.send_at = send_at
+        self.channel = channel
+        self.mention_prefix = mention_prefix
+        
+        self.message_input = discord.ui.TextInput(
+            label="送信メッセージ本文（改行入力可能）",
+            style=discord.TextStyle.paragraph,
+            placeholder="送信したいメッセージを入力してください。\nEnterキーでそのまま改行できます。",
+            required=True,
+            max_length=2000
+        )
+        self.add_item(self.message_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        raw_msg = self.message_input.value.strip()
+        
+        final_msg = f"{self.mention_prefix}\n{raw_msg}" if self.mention_prefix else raw_msg
+        
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT INTO schedules (channel_id, send_at, message) VALUES (?, ?, ?)", (self.channel.id, self.send_at, final_msg))
+        conn.commit()
+        conn.close()
+        
+        mention_info = f"\n• メンション: `{self.mention_prefix}`" if self.mention_prefix else ""
+        await interaction.followup.send(
+            f"✅ {self.channel.mention} 宛に **{self.send_at}** のメッセージ送信予約を完了しました！{mention_info}\n\n"
+            f"📝 **予約メッセージ内容:**\n```\n{final_msg}\n```",
+            ephemeral=True,
+            silent=True
+        )
+
 class ScheduleEditModal(discord.ui.Modal, title="📅 予約メッセージの編集"):
     def __init__(self, schedule_id: int, current_send_at: str, current_message: str):
         super().__init__()
@@ -485,7 +522,7 @@ class MyClient(discord.Client):
                     print(f"Could not fetch channel {ch_id} for schedule {sid}: {e}")
             if ch:
                 try:
-                    await ch.send(msg, silent=True)
+                    await ch.send(msg)
                     c.execute("DELETE FROM schedules WHERE id = ?", (sid,))
                 except Exception as e:
                     print(f"Failed to send schedule {sid}: {e}")
@@ -1585,20 +1622,72 @@ async def cancel_deadline(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"エラーが発生しました: {e}", silent=True)
 
-@client.tree.command(name="schedule_message", description="【運営用】指定日時にメッセージを予約送信します")
+@client.tree.command(name="schedule_message", description="【運営用】指定日時にメッセージを予約送信します（メンション選択＆改行対応）")
 @app_commands.default_permissions(administrator=True)
-async def schedule_message(interaction: discord.Interaction, target_time: str, channel: discord.TextChannel, message: str):
-    # format: YYYY-MM-DD HH:MM
+@app_commands.describe(
+    target_time="送信予定日時 (例: 2026-07-30 18:00)",
+    channel="送信先のテキストチャンネル",
+    mention_type="メンションの種類 (指定しない場合はメンションなし)",
+    role="メンションするロール (mention_typeで『指定ロール』を選ぶか直接ロールを指定)",
+    message="メッセージ本文 (省略すると改行入力ができる専用画面が開きます)"
+)
+@app_commands.choices(mention_type=[
+    app_commands.Choice(name="なし (メンション不要)", value="none"),
+    app_commands.Choice(name="@everyone (全体)", value="everyone"),
+    app_commands.Choice(name="@here (アクティブメンバー)", value="here"),
+    app_commands.Choice(name="特定ロール指定", value="role"),
+])
+async def schedule_message(
+    interaction: discord.Interaction,
+    target_time: str,
+    channel: discord.TextChannel,
+    mention_type: Optional[str] = None,
+    role: Optional[discord.Role] = None,
+    message: Optional[str] = None
+):
     try:
         dt = datetime.datetime.strptime(target_time, "%Y-%m-%d %H:%M")
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("INSERT INTO schedules (channel_id, send_at, message) VALUES (?, ?, ?)", (channel.id, dt.strftime("%Y-%m-%d %H:%M"), message))
-        conn.commit()
-        conn.close()
-        await interaction.response.send_message(f"{channel.mention} 宛に {target_time} に送信予約しました。", silent=True)
-    except Exception:
-        await interaction.response.send_message("フォーマットが違います。例: 2026-06-30 18:00", ephemeral=True, silent=True)
+        send_at_str = dt.strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        await interaction.response.send_message("❌ 送信日時のフォーマットが間違っています。例: `2026-07-30 18:00`", ephemeral=True, silent=True)
+        return
+
+    # メンション文字列の組み立て
+    mention_prefix = ""
+    if mention_type == "everyone":
+        mention_prefix = "@everyone"
+    elif mention_type == "here":
+        mention_prefix = "@here"
+    elif mention_type == "role" or role is not None:
+        if role:
+            mention_prefix = role.mention
+        else:
+            await interaction.response.send_message("❌ 『特定ロール指定』を選ぶ場合は、ロール引数でロールを選択してください。", ephemeral=True, silent=True)
+            return
+
+    # メッセージ本文が空の場合は Modal ポップアップ入力画面を開く
+    if not message:
+        modal = ScheduleCreateModal(send_at_str, channel, mention_prefix)
+        await interaction.response.send_modal(modal)
+        return
+
+    # 直接入力された場合は \n を実際の改行コードに変換
+    raw_msg = message.replace("\\n", "\n").strip()
+    final_msg = f"{mention_prefix}\n{raw_msg}" if mention_prefix else raw_msg
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO schedules (channel_id, send_at, message) VALUES (?, ?, ?)", (channel.id, send_at_str, final_msg))
+    conn.commit()
+    conn.close()
+
+    mention_info = f"\n• メンション: `{mention_prefix}`" if mention_prefix else ""
+    await interaction.response.send_message(
+        f"✅ {channel.mention} 宛に **{send_at_str}** のメッセージ送信予約を完了しました！{mention_info}\n\n"
+        f"📝 **予約メッセージ内容:**\n```\n{final_msg}\n```",
+        ephemeral=True,
+        silent=True
+    )
 
 @client.tree.command(name="add_knowledge", description="【運営用】AIのナレッジベース（RAG）に情報を追加します")
 @app_commands.default_permissions(administrator=True)
