@@ -817,11 +817,11 @@ async def setup_onboarding(interaction: discord.Interaction):
         except Exception as e:
             results.append(f"⚠️ 🏁｜ようこそ の清掃に失敗しました: {e}")
         embed1 = discord.Embed(
-            title="🎉 ABCABC コミュニティへようこそ！",
+            title="🎉 DISRUPT AI Hackathon コミュニティへようこそ！",
             description=(
                 "このサーバーに参加してくれた皆さん、本当にありがとうございます！\n"
                 "ここは、AIやテクノロジーを活用して新しいプロダクト作りに挑む仲間が集まるコミュニティです。\n\n"
-                "直近では **ABCABC AI Hackathon 2026** のメイン会場として稼働しますが、"
+                "直近では **DISRUPT AI Hackathon 2026** のメイン会場として稼働しますが、"
                 "その後も文系・理系、職種を問わず、本気でものづくりをする人たちが継続して交流できる場を目指しています。\n"
                 "エンジニアだけの戦場ではありません。企画力、デザイン力、プレゼン力——すべてが武器になります。"
             ),
@@ -993,7 +993,7 @@ async def setup_onboarding(interaction: discord.Interaction):
             ),
             color=0x448AFF,
         )
-        guide_embed3.set_footer(text="ABCABC AI Hackathon 2026 運営チーム")
+        guide_embed3.set_footer(text="DISRUPT AI Hackathon 2026 運営チーム")
 
         await guide_ch.send(embeds=[guide_embed1, guide_embed2, guide_embed3], silent=True)
 

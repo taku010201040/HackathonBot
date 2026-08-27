@@ -4,7 +4,7 @@
 
 variable "common" {
   default = {
-    "server_name" = "Sample Discord Terraform"
+    "server_name" = "DISRUPT AI Hackathon"
   }
 }
 

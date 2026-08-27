@@ -1,16 +1,16 @@
-﻿import re
+import re
 
 with open('main.py', 'r', encoding='utf-8') as f:
     content = f.read()
 
 # Replace Welcome text
 content = re.sub(
-    r'title="🎉 ABCABC AI Hackathon 2026 へようこそ！",\s*description=\([\s\S]*?\),\s*color=0x00E676,',
-    '''title="🎉 ABCABC コミュニティへようこそ！",
+    r'title="🎉 DISRUPT AI Hackathon 2026 へようこそ！",\s*description=\([\s\S]*?\),\s*color=0x00E676,',
+    '''title="🎉 DISRUPT AI Hackathon コミュニティへようこそ！",
             description=(
                 "このサーバーに参加してくれた皆さん、本当にありがとうございます！\\n"
                 "ここは、AIやテクノロジーを活用して新しいプロダクト作りに挑む仲間が集まるコミュニティです。\\n\\n"
-                "直近では **ABCABC AI Hackathon 2026** のメイン会場として稼働しますが、"
+                "直近では **DISRUPT AI Hackathon 2026** のメイン会場として稼働しますが、"
                 "その後も文系・理系、職種を問わず、本気でものづくりをする人たちが継続して交流できる場を目指しています。\\n"
                 "エンジニアだけの戦場ではありません。企画力、デザイン力、プレゼン力——すべてが武器になります。"
             ),
