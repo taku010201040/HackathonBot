@@ -12,3 +12,5 @@ services:
         value: "1509594439293862019, 1516443747259252927"
       - key: GEMINI_API_KEY
         sync: false
+      - key: DATABASE_URL
+        sync: false

@@ -15,9 +15,54 @@ import asyncio
 import re
 from typing import Optional
 
+load_dotenv()
+
 DB_PATH = "bot_data.db"
+# DATABASE_URL が設定されている時だけ Postgres を使い、未設定時は従来通り SQLite を使う。
+# Render の無料プランには永続ディスクがないため、再起動で消える問題は
+# 外部の無料 Postgres（Neon 等）の URL を DATABASE_URL に入れることで解消する。
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+USE_POSTGRES = bool(DATABASE_URL)
+
+def _translate_sql(sql):
+    if not USE_POSTGRES:
+        return sql
+    sql = sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+    m = re.match(r"\s*INSERT OR REPLACE INTO (\w+)\s*\(([^)]+)\)\s*VALUES\s*\((.*)\)\s*$", sql, re.IGNORECASE | re.DOTALL)
+    if m:
+        table, cols_raw, vals_raw = m.group(1), m.group(2), m.group(3)
+        cols = [c.strip() for c in cols_raw.split(",")]
+        pk = {"settings": "key", "users": "user_id"}.get(table)
+        if pk:
+            rest = [c for c in cols if c != pk]
+            sets = ", ".join(f"{c} = EXCLUDED.{c}" for c in rest)
+            vals_raw = vals_raw.replace("?", "%s")
+            return f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({vals_raw}) ON CONFLICT ({pk}) DO UPDATE SET {sets}"
+    return sql.replace("?", "%s")
+
+class _Cursor:
+    def __init__(self, cur):
+        self._cur = cur
+    def execute(self, sql, params=()):
+        return self._cur.execute(_translate_sql(sql), params)
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+class _Connection:
+    def __init__(self, conn):
+        self._conn = conn
+    def cursor(self):
+        return _Cursor(self._conn.cursor())
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+def db_connect():
+    if USE_POSTGRES:
+        import psycopg2
+        return _Connection(psycopg2.connect(DATABASE_URL))
+    return _Connection(sqlite3.connect(DB_PATH))
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     c = conn.cursor()
     c.execute('CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, xp INTEGER DEFAULT 0, level INTEGER DEFAULT 1)')
     c.execute('CREATE TABLE IF NOT EXISTS knowledge (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT)')
@@ -35,7 +80,7 @@ except:
     pass
 
 def get_knowledge_context():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     c = conn.cursor()
     c.execute('SELECT content FROM knowledge')
     rows = c.fetchall()
@@ -335,7 +380,7 @@ class ScheduleCreateModal(discord.ui.Modal, title="📅 メッセージ予約送
         
         final_msg = f"{self.mention_prefix}\n{raw_msg}" if self.mention_prefix else raw_msg
         
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         c = conn.cursor()
         c.execute("INSERT INTO schedules (channel_id, send_at, message) VALUES (?, ?, ?)", (self.channel.id, self.send_at, final_msg))
         conn.commit()
@@ -380,7 +425,7 @@ class ScheduleEditModal(discord.ui.Modal, title="📅 予約メッセージの�
             await interaction.followup.send("エラー: 日時のフォーマットが正しくありません。例: 2026-07-30 18:00", ephemeral=True, silent=True)
             return
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         c = conn.cursor()
         c.execute("UPDATE schedules SET send_at = ?, message = ? WHERE id = ?", (send_at_str, new_msg, self.schedule_id))
         conn.commit()
@@ -402,7 +447,7 @@ class ScheduleActionView(discord.ui.View):
 
     @discord.ui.button(label="🗑️ 予約を削除", style=discord.ButtonStyle.danger)
     async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         c = conn.cursor()
         c.execute("DELETE FROM schedules WHERE id = ?", (self.schedule_id,))
         conn.commit()
@@ -424,7 +469,7 @@ class ScheduleSelectDropdown(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         sid = int(self.values[0])
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         c = conn.cursor()
         c.execute("SELECT id, channel_id, send_at, message FROM schedules WHERE id = ?", (sid,))
         row = c.fetchone()
@@ -469,7 +514,7 @@ class MyClient(discord.Client):
         if not guilds: return
         
         for guild in guilds:
-            conn = sqlite3.connect(DB_PATH)
+            conn = db_connect()
             c = conn.cursor()
             c.execute("SELECT value FROM settings WHERE key='deadline'")
             row = c.fetchone()
@@ -506,7 +551,7 @@ class MyClient(discord.Client):
 
     @tasks.loop(minutes=1)
     async def schedule_loop(self):
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         c = conn.cursor()
         jst = datetime.timezone(datetime.timedelta(hours=9))
         now_str = datetime.datetime.now(jst).strftime("%Y-%m-%d %H:%M")
@@ -540,7 +585,7 @@ class MyClient(discord.Client):
                 events = await guild.fetch_scheduled_events()
                 now = datetime.datetime.now(datetime.timezone.utc)
 
-                conn = sqlite3.connect(DB_PATH)
+                conn = db_connect()
                 c = conn.cursor()
 
                 c.execute("SELECT value FROM settings WHERE key='event_reminder_enabled'")
@@ -634,7 +679,7 @@ class MyClient(discord.Client):
         now_jst = datetime.datetime.now(jst)
         if now_jst.hour == 8 and now_jst.minute == 0:
             today_str = now_jst.strftime("%Y-%m-%d")
-            conn = sqlite3.connect(DB_PATH)
+            conn = db_connect()
             c = conn.cursor()
             c.execute("SELECT 1 FROM settings WHERE key='ai_news_last_posted_date' AND value=?", (today_str,))
             if c.fetchone() is not None:
@@ -1378,7 +1423,7 @@ async def on_reaction_add(reaction, user):
     target_user = reaction.message.author
     if target_user.bot: return
     
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     c = conn.cursor()
     c.execute('SELECT xp, level FROM users WHERE user_id = ?', (target_user.id,))
     row = c.fetchone()
@@ -1543,7 +1588,7 @@ async def timer_cmd(interaction: discord.Interaction, minutes: int, message: str
 @client.tree.command(name="level", description="現在の自分のレベルと経験値（XP）を確認します")
 async def check_level(interaction: discord.Interaction):
     user = interaction.user
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     c = conn.cursor()
     c.execute('SELECT xp, level FROM users WHERE user_id = ?', (user.id,))
     row = c.fetchone()
@@ -1587,7 +1632,7 @@ async def set_deadline(interaction: discord.Interaction, target_time: str):
     # format: YYYY-MM-DD HH:MM
     try:
         dt = datetime.datetime.strptime(target_time, "%Y-%m-%d %H:%M")
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('deadline', ?)", (dt.isoformat(),))
         conn.commit()
@@ -1601,7 +1646,7 @@ async def set_deadline(interaction: discord.Interaction, target_time: str):
 async def cancel_deadline(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         c = conn.cursor()
         c.execute("DELETE FROM settings WHERE key='deadline'")
         conn.commit()
@@ -1675,7 +1720,7 @@ async def schedule_message(
     raw_msg = message.replace("\\n", "\n").strip()
     final_msg = f"{mention_prefix}\n{raw_msg}" if mention_prefix else raw_msg
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     c = conn.cursor()
     c.execute("INSERT INTO schedules (channel_id, send_at, message) VALUES (?, ?, ?)", (channel.id, send_at_str, final_msg))
     conn.commit()
@@ -1692,7 +1737,7 @@ async def schedule_message(
 @client.tree.command(name="add_knowledge", description="【運営用】AIのナレッジベース（RAG）に情報を追加します")
 @app_commands.default_permissions(administrator=True)
 async def add_knowledge(interaction: discord.Interaction, text: str):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     c = conn.cursor()
     c.execute("INSERT INTO knowledge (content) VALUES (?)", (text,))
     conn.commit()
@@ -1756,7 +1801,7 @@ async def setup_event_reminder(
     minutes_before: int = None
 ):
     await interaction.response.defer(ephemeral=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     c = conn.cursor()
     
     updated = []
@@ -1795,7 +1840,7 @@ async def setup_event_reminder(
 ])
 async def cancel_event_reminder(interaction: discord.Interaction, action: app_commands.Choice[str]):
     await interaction.response.defer(ephemeral=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     c = conn.cursor()
     
     if action.value == "disable":
@@ -1818,7 +1863,7 @@ async def cancel_event_reminder(interaction: discord.Interaction, action: app_co
 @app_commands.default_permissions(administrator=True)
 async def list_schedules(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     c = conn.cursor()
     
     # 1. イベントリマインダー設定の取得
