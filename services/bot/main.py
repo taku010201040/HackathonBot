@@ -151,7 +151,7 @@ async def ask_gemini(prompt: str, guild: discord.Guild = None) -> str:
         full_context += f"\n\n【過去のDiscordのやり取り（参考）】\n{excerpts}"
     system_instruction = f"あなたはハッカソンのサポートAIです。以下のナレッジおよびサーバー情報を参考にして回答してください。\n【情報】\n{full_context}"
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=system_instruction, generation_config=generation_config)
+        model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=system_instruction, generation_config=generation_config)
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
@@ -162,6 +162,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '..', '..', '.env'))
 
 TOKEN = os.getenv('DISCORD_TOKEN')
 GUILD_ID = os.getenv('DISCORD_SERVER_ID')
+GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-flash-latest')
 
 def get_guild_ids():
     raw = os.getenv('DISCORD_SERVER_ID') or os.getenv('DISCORD_SERVER_IDS') or ""
@@ -733,7 +734,7 @@ class MyClient(discord.Client):
                 "・日本語で丁寧かつ読みやすいレイアウトで作成してください。"
             )
             try:
-                model = genai.GenerativeModel('gemini-1.5-flash', generation_config=generation_config)
+                model = genai.GenerativeModel(GEMINI_MODEL, generation_config=generation_config)
                 response = model.generate_content(news_prompt)
                 news_content = response.text
                 
