@@ -87,6 +87,35 @@ def get_knowledge_context():
     conn.close()
     return "\n---\n".join([r[0] for r in rows])
 
+def search_discord_history(query: str, limit: int = 8):
+    """過去のDiscord投稿から関連するものを探す（RAG検索）。Postgres専用。"""
+    try:
+        conn = db_connect()
+        c = conn.cursor()
+        c.execute('SELECT place, author, ts, content FROM discord_messages WHERE similarity(content, ?) > 0.05 ORDER BY similarity(content, ?) DESC LIMIT ?', (query, query, limit))
+        rows = c.fetchall()
+        conn.close()
+        return rows
+    except Exception:
+        return []
+
+def log_discord_message(message) -> None:
+    """新しい投稿をRAG用に記録する（Bot自身の投稿は除く）。"""
+    content = (message.content or "").strip()
+    if not content:
+        return
+    ch = message.channel
+    is_thread = isinstance(ch, discord.Thread)
+    name = getattr(ch, 'name', None) or str(ch.id)
+    guild_name = message.guild.name if message.guild else "DM"
+    author_name = getattr(message.author, 'global_name', None) or getattr(message.author, 'name', 'unknown')
+    conn = db_connect()
+    c = conn.cursor()
+    c.execute('INSERT INTO discord_messages (msg_id, guild_name, place, place_id, is_thread, author, is_bot, ts, content) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (msg_id) DO NOTHING',
+              (str(message.id), guild_name, "#" + name, str(ch.id), is_thread, author_name, False, message.created_at.isoformat(), message.content))
+    conn.commit()
+    conn.close()
+
 def get_server_structure_context(guild: discord.Guild = None) -> str:
     if not guild:
         return ""
@@ -114,8 +143,12 @@ async def ask_gemini(prompt: str, guild: discord.Guild = None) -> str:
         return "Gemini APIキーが設定されていません。"
     context = get_knowledge_context()
     server_struct = get_server_structure_context(guild)
-    
+    discord_hits = search_discord_history(prompt)
+
     full_context = f"{context}\n\n{server_struct}".strip()
+    if discord_hits:
+        excerpts = "\n".join(f"・{place} {author}: {content[:200]}" for place, author, _ts, content in discord_hits)
+        full_context += f"\n\n【過去のDiscordのやり取り（参考）】\n{excerpts}"
     system_instruction = f"あなたはハッカソンのサポートAIです。以下のナレッジおよびサーバー情報を参考にして回答してください。\n【情報】\n{full_context}"
     try:
         model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=system_instruction, generation_config=generation_config)
@@ -1487,6 +1520,10 @@ async def on_message(message: discord.Message):
 
     if message.author.bot:
         return
+    try:
+        log_discord_message(message)
+    except Exception as e:
+        print(f"History log failed: {e}")
     # AI技術サポート/チャット (DMまたはメンションされた場合)
     is_dm = isinstance(message.channel, discord.DMChannel)
     if is_dm or client.user.mentioned_in(message):
