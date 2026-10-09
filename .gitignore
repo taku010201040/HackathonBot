@@ -64,6 +64,7 @@ terraform.zip
 # Bot runtime data (regenerated on start, never commit)
 bot_data.db
 *.log
+discord_export/
 
 # Windows
 desktop.ini
