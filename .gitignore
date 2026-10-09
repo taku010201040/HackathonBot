@@ -60,3 +60,10 @@ ENV/
 # Terraform binaries & zip
 terraform.exe
 terraform.zip
+
+# Bot runtime data (regenerated on start, never commit)
+bot_data.db
+*.log
+
+# Windows
+desktop.ini

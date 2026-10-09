@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: disrupt-hackathon-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python services/bot/main.py
+    healthCheckPath: /
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: DISCORD_SERVER_ID
+        value: "1509594439293862019, 1516443747259252927"
+      - key: GEMINI_API_KEY
+        sync: false
