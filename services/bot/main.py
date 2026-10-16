@@ -87,11 +87,26 @@ def get_knowledge_context():
     conn.close()
     return "\n---\n".join([r[0] for r in rows])
 
+def embed_query(text: str):
+    """質問文を意味ベクトルに変換する。失敗時はNone。"""
+    try:
+        r = genai.embed_content(model="models/gemini-embedding-001", content=text[:1500], task_type="retrieval_query")
+        return "[" + ",".join(str(float(x)) for x in r["embedding"]) + "]"
+    except Exception:
+        return None
+
 def search_discord_history(query: str, limit: int = 8):
-    """過去のDiscord投稿から関連するものを探す（RAG検索）。Postgres専用。"""
+    """過去のDiscord投稿から関連するものを探す（意味検索→言葉検索の順）。Postgres専用。"""
     try:
         conn = db_connect()
         c = conn.cursor()
+        vec = embed_query(query)
+        if vec:
+            c.execute('SELECT place, author, ts, content FROM discord_messages WHERE embedding IS NOT NULL ORDER BY embedding <=> ?::vector LIMIT ?', (vec, limit))
+            rows = c.fetchall()
+            if rows:
+                conn.close()
+                return rows
         c.execute('SELECT place, author, ts, content FROM discord_messages WHERE similarity(content, ?) > 0.05 ORDER BY similarity(content, ?) DESC LIMIT ?', (query, query, limit))
         rows = c.fetchall()
         conn.close()
@@ -114,6 +129,13 @@ def log_discord_message(message) -> None:
     c.execute('INSERT INTO discord_messages (msg_id, guild_name, place, place_id, is_thread, author, is_bot, ts, content) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (msg_id) DO NOTHING',
               (str(message.id), guild_name, "#" + name, str(ch.id), is_thread, author_name, False, message.created_at.isoformat(), message.content))
     conn.commit()
+    try:
+        vec = embed_query(message.content)
+        if vec:
+            c.execute('UPDATE discord_messages SET embedding = ?::vector WHERE msg_id = ?', (vec, str(message.id)))
+            conn.commit()
+    except Exception as e:
+        print(f"Embed log failed: {e}")
     conn.close()
 
 def get_server_structure_context(guild: discord.Guild = None) -> str:
