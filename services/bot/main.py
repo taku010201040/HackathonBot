@@ -138,6 +138,40 @@ def log_discord_message(message) -> None:
         print(f"Embed log failed: {e}")
     conn.close()
 
+def embed_backfill_once(max_rows: int = 150):
+    """未埋め込みの投稿をまとめて意味化する。戻り値=(処理数, 残り数)。429時は休憩込みで自動継続。"""
+    conn = db_connect()
+    c = conn.cursor()
+    c.execute("SELECT count(*) FROM discord_messages WHERE embedding IS NULL AND content <> '';")
+    remaining = c.fetchone()[0]
+    if remaining == 0:
+        conn.close()
+        return (0, 0)
+    c.execute("SELECT msg_id, left(content, 1500) FROM discord_messages WHERE embedding IS NULL AND content <> '' LIMIT ?", (max_rows,))
+    rows = c.fetchall()
+    done = 0
+    for mid, text in rows:
+        vec = None
+        for attempt in range(3):
+            try:
+                r = genai.embed_content(model="models/gemini-embedding-001", content=text, task_type="retrieval_document")
+                vec = "[" + ",".join(str(float(x)) for x in r["embedding"]) + "]"
+                break
+            except Exception as e:
+                if "429" in str(e):
+                    break  # 上限中：この周期はここまで
+                time.sleep(20)
+        if not vec:
+            break  # 上限中：この周期はここまで
+        c.execute("UPDATE discord_messages SET embedding = ?::vector WHERE msg_id = ?", (vec, mid))
+        conn.commit()
+        done += 1
+        time.sleep(1.0)
+    c.execute("SELECT count(*) FROM discord_messages WHERE embedding IS NULL AND content <> '';")
+    remaining_after = c.fetchone()[0]
+    conn.close()
+    return (done, remaining_after)
+
 def get_server_structure_context(guild: discord.Guild = None) -> str:
     if not guild:
         return ""
@@ -604,6 +638,16 @@ class MyClient(discord.Client):
                             await ch.delete()
                 except Exception as e:
                     print(f"Deadline loop cleanup error: {e}")
+
+    @tasks.loop(minutes=60)
+    async def embed_backfill_loop(self):
+        """未埋め込みの投稿を徐々に意味化する（自動継続・上限回復後も勝手に進む）。"""
+        try:
+            done, remaining = await asyncio.to_thread(embed_backfill_once, 150)
+            if done or remaining:
+                print(f"Embed backfill: +{done}, remaining {remaining}")
+        except Exception as e:
+            print(f"Embed backfill error: {e}")
 
     @tasks.loop(minutes=1)
     async def schedule_loop(self):
