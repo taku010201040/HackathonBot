@@ -9,6 +9,7 @@ from deep_translator import GoogleTranslator
 
 import sqlite3
 import datetime
+import time
 from discord.ext import tasks
 import google.generativeai as genai
 import asyncio
@@ -475,6 +476,8 @@ class ScheduleCreateModal(discord.ui.Modal, title="📅 メッセージ予約送
         c.execute("INSERT INTO schedules (channel_id, send_at, message) VALUES (?, ?, ?)", (self.channel.id, self.send_at, final_msg))
         conn.commit()
         conn.close()
+        if 'client' in globals():
+            client.mark_schedules_dirty()
         
         mention_info = f"\n• メンション: `{self.mention_prefix}`" if self.mention_prefix else ""
         await interaction.followup.send(
@@ -520,6 +523,8 @@ class ScheduleEditModal(discord.ui.Modal, title="📅 予約メッセージの�
         c.execute("UPDATE schedules SET send_at = ?, message = ? WHERE id = ?", (send_at_str, new_msg, self.schedule_id))
         conn.commit()
         conn.close()
+        if 'client' in globals():
+            client.mark_schedules_dirty()
         
         await interaction.followup.send(f"✅ 予約メッセージ（ID: {self.schedule_id}）を更新しました！\n• 予約日時: `{send_at_str}`", ephemeral=True, silent=True)
 
@@ -542,6 +547,8 @@ class ScheduleActionView(discord.ui.View):
         c.execute("DELETE FROM schedules WHERE id = ?", (self.schedule_id,))
         conn.commit()
         conn.close()
+        if 'client' in globals():
+            client.mark_schedules_dirty()
         
         button.disabled = True
         button.label = "削除済み"
@@ -595,8 +602,59 @@ class MyClient(discord.Client):
         intents.message_content = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
+        # DB負荷削減: settings / schedules / 発報済みイベントをメモリキャッシュで持つ
+        self._settings_cache = {}
+        self._settings_cache_ok = False
+        self._settings_cache_at = 0.0
+        self._schedules_cache = []
+        self._schedules_cache_at = 0.0
+        self._schedules_dirty = True
+        self._reminded_events = set()
+        self._reminded_events_ok = False
 
-    
+    def get_setting(self, key):
+        """settingsをメモリキャッシュ経由で読む（5分TTL、DB直クエリを1分ループから無くす）。"""
+        now = time.time()
+        if (not self._settings_cache_ok) or (now - self._settings_cache_at > 300):
+            try:
+                conn = db_connect()
+                c = conn.cursor()
+                c.execute("SELECT key, value FROM settings")
+                d = {}
+                for row in c.fetchall():
+                    d[row[0]] = row[1]
+                conn.close()
+                self._settings_cache = d
+                self._settings_cache_ok = True
+                self._settings_cache_at = now
+            except Exception:
+                # 失敗時は30秒後に再試行、それまでは既存キャッシュ値を返す
+                self._settings_cache_at = now - 30
+                return self._settings_cache.get(key)
+        return self._settings_cache.get(key)
+
+    def mark_schedules_dirty(self):
+        self._schedules_dirty = True
+
+    def refresh_schedules(self):
+        try:
+            conn = db_connect()
+            c = conn.cursor()
+            c.execute("SELECT id, channel_id, send_at, message FROM schedules")
+            rows = c.fetchall()
+            conn.close()
+            data = []
+            for r in rows:
+                try:
+                    data.append((int(r[0]), int(r[1]), r[2], r[3]))
+                except Exception:
+                    continue
+            self._schedules_cache = data
+            self._schedules_dirty = False
+            self._schedules_cache_at = time.time()
+        except Exception as e:
+            print(f"Schedules cache reload failed: {e}")
+
     @tasks.loop(minutes=60)
     async def deadline_loop(self):
         target_gids = get_guild_ids()
@@ -651,14 +709,15 @@ class MyClient(discord.Client):
 
     @tasks.loop(minutes=1)
     async def schedule_loop(self):
-        conn = db_connect()
-        c = conn.cursor()
         jst = datetime.timezone(datetime.timedelta(hours=9))
         now_str = datetime.datetime.now(jst).strftime("%Y-%m-%d %H:%M")
-        c.execute("SELECT id, channel_id, message FROM schedules WHERE send_at <= ?", (now_str,))
-        rows = c.fetchall()
-        for r in rows:
-            sid, ch_id, msg = r
+        # 予約一覧はメモリキャッシュで管理（Azure/Neon接続を毎分打たない）。更新は発報時と5分毎・登録変更時のみ。
+        if self._schedules_dirty or time.time() - self._schedules_cache_at > 300:
+            self.refresh_schedules()
+        if self._schedules_dirty:
+            return
+        due = [s for s in self._schedules_cache if s[2] and s[2] <= now_str]
+        for sid, ch_id, _, msg in due:
             ch = self.get_channel(ch_id)
             if not ch:
                 try:
@@ -668,11 +727,18 @@ class MyClient(discord.Client):
             if ch:
                 try:
                     await ch.send(msg)
-                    c.execute("DELETE FROM schedules WHERE id = ?", (sid,))
                 except Exception as e:
                     print(f"Failed to send schedule {sid}: {e}")
-        conn.commit()
-        conn.close()
+                    continue
+                self._schedules_cache = [s for s in self._schedules_cache if s[0] != sid]
+                try:
+                    conn = db_connect()
+                    c = conn.cursor()
+                    c.execute("DELETE FROM schedules WHERE id = ?", (sid,))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    print(f"Schedule delete failed for {sid}: {e}")
 
     @tasks.loop(minutes=1)
     async def event_reminder_loop(self):
@@ -683,92 +749,104 @@ class MyClient(discord.Client):
         for guild in guilds:
             try:
                 events = await guild.fetch_scheduled_events()
+                if not events:
+                    continue
                 now = datetime.datetime.now(datetime.timezone.utc)
+
+                # DB負荷削減: 設定読み取りはキャッシュ経由（5分TTL）。イベントが無い時はDBに触らない。
+                if self.get_setting("event_reminder_enabled") == "false":
+                    continue
+
+                ch_id_val = self.get_setting("event_reminder_channel_id")
+                role_id_val = self.get_setting("event_reminder_role_id")
+                tpl_val = self.get_setting("event_reminder_template")
+                mins_val = self.get_setting("event_reminder_minutes_before")
+                target_minutes = int(mins_val) if mins_val else 60
+                target_seconds = target_minutes * 60
+
+                # 発報すべきイベントだけ先に確定（この段階ではDB未接続）
+                due_events = []
+                for event in events:
+                    if event.status != discord.EventStatus.scheduled:
+                        continue
+                    diff = event.start_time - now
+                    if 0 <= diff.total_seconds() <= target_seconds:
+                        due_events.append(event)
+                if not due_events:
+                    continue
 
                 conn = db_connect()
                 c = conn.cursor()
 
-                c.execute("SELECT value FROM settings WHERE key='event_reminder_enabled'")
-                enabled_row = c.fetchone()
-                if enabled_row and enabled_row[0] == 'false':
-                    conn.close()
-                    continue
-
-                c.execute("SELECT value FROM settings WHERE key='event_reminder_channel_id'")
-                ch_row = c.fetchone()
-                c.execute("SELECT value FROM settings WHERE key='event_reminder_role_id'")
-                role_row = c.fetchone()
-                c.execute("SELECT value FROM settings WHERE key='event_reminder_template'")
-                tpl_row = c.fetchone()
-                c.execute("SELECT value FROM settings WHERE key='event_reminder_minutes_before'")
-                minutes_row = c.fetchone()
-                target_minutes = int(minutes_row[0]) if minutes_row else 60
-                target_seconds = target_minutes * 60
-
-                for event in events:
-                    if event.status != discord.EventStatus.scheduled:
+                # 発報済みリストはプロセス内で1回だけ読む
+                if not self._reminded_events_ok:
+                    try:
+                        c.execute("SELECT event_id FROM event_reminders")
+                        self._reminded_events = {r[0] for r in c.fetchall()}
+                        self._reminded_events_ok = True
+                    except Exception as e:
+                        print(f"Event reminders load failed: {e}")
+                        conn.close()
                         continue
 
-                    diff = event.start_time - now
-                    diff_seconds = diff.total_seconds()
+                for event in due_events:
+                    if str(event.id) in self._reminded_events:
+                        continue
+                    announce_ch = None
+                    if ch_id_val:
+                        try:
+                            announce_ch = guild.get_channel(int(ch_id_val))
+                        except:
+                            pass
+                    if not announce_ch:
+                        announce_ch = discord.utils.get(guild.text_channels, name="📢｜全体アナウンス")
+                    if not announce_ch:
+                        announce_ch = discord.utils.get(guild.text_channels, name="📅｜イベントカレンダー")
+                    if not announce_ch:
+                        announce_ch = discord.utils.find(lambda ch: "アナウンス" in ch.name, guild.text_channels)
+                    if not announce_ch:
+                        announce_ch = guild.system_channel
 
-                    if 0 <= diff_seconds <= target_seconds:
-                        c.execute("SELECT 1 FROM event_reminders WHERE event_id = ?", (str(event.id),))
-                        if c.fetchone() is None:
-                            announce_ch = None
-                            if ch_row:
-                                try:
-                                    announce_ch = guild.get_channel(int(ch_row[0]))
-                                except:
-                                    pass
-                            if not announce_ch:
-                                announce_ch = discord.utils.get(guild.text_channels, name="📢｜全体アナウンス")
-                            if not announce_ch:
-                                announce_ch = discord.utils.get(guild.text_channels, name="📅｜イベントカレンダー")
-                            if not announce_ch:
-                                announce_ch = discord.utils.find(lambda ch: "アナウンス" in ch.name, guild.text_channels)
-                            if not announce_ch:
-                                announce_ch = guild.system_channel
+                    if announce_ch:
+                        mention_str = ""
+                        if role_id_val:
+                            try:
+                                role = guild.get_role(int(role_id_val))
+                                if role:
+                                    mention_str = role.mention
+                            except:
+                                pass
+                        if not mention_str:
+                            participant_role = discord.utils.get(guild.roles, name="参加者")
+                            mention_str = participant_role.mention if participant_role else "@everyone"
 
-                            if announce_ch:
-                                mention_str = ""
-                                if role_row:
-                                    try:
-                                        role = guild.get_role(int(role_row[0]))
-                                        if role:
-                                            mention_str = role.mention
-                                    except:
-                                        pass
-                                if not mention_str:
-                                    participant_role = discord.utils.get(guild.roles, name="参加者")
-                                    mention_str = participant_role.mention if participant_role else "@everyone"
+                        timestamp = int(event.start_time.timestamp())
+                        time_str = f"<t:{timestamp}:F> (<t:{timestamp}:R>)"
+                        location_str = event.location or "Discord内"
 
-                                timestamp = int(event.start_time.timestamp())
-                                time_str = f"<t:{timestamp}:F> (<t:{timestamp}:R>)"
-                                location_str = event.location or "Discord内"
+                        if tpl_val and tpl_val.strip():
+                            template = tpl_val.replace("\\n", "\n")
+                            msg = template.replace("{name}", event.name)\
+                                          .replace("{time}", time_str)\
+                                          .replace("{location}", location_str)\
+                                          .replace("{url}", event.url)
+                            if "{role}" in msg:
+                                msg = msg.replace("{role}", mention_str)
+                            else:
+                                msg = f"{mention_str}\n{msg}"
+                        else:
+                            msg = (
+                                f"{mention_str} 📢 **イベント開催{target_minutes}分前リマインド**\n\n"
+                                f"イベント「**{event.name}**」がまもなく開始されます！\n\n"
+                                f"📅 **開始時刻**: {time_str}\n"
+                                f"📍 **場所**: {location_str}\n"
+                                f"🔗 **詳細・参加表明はこちら**: {event.url}"
+                            )
 
-                                if tpl_row and tpl_row[0].strip():
-                                    template = tpl_row[0].replace("\\n", "\n")
-                                    msg = template.replace("{name}", event.name)\
-                                                  .replace("{time}", time_str)\
-                                                  .replace("{location}", location_str)\
-                                                  .replace("{url}", event.url)
-                                    if "{role}" in msg:
-                                        msg = msg.replace("{role}", mention_str)
-                                    else:
-                                        msg = f"{mention_str}\n{msg}"
-                                else:
-                                    msg = (
-                                        f"{mention_str} 📢 **イベント開催{target_minutes}分前リマインド**\n\n"
-                                        f"イベント「**{event.name}**」がまもなく開始されます！\n\n"
-                                        f"📅 **開始時刻**: {time_str}\n"
-                                        f"📍 **場所**: {location_str}\n"
-                                        f"🔗 **詳細・参加表明はこちら**: {event.url}"
-                                    )
-
-                                await announce_ch.send(msg)
-                                c.execute("INSERT INTO event_reminders (event_id, reminded_at) VALUES (?, ?)", (str(event.id), now.isoformat()))
-                                conn.commit()
+                        await announce_ch.send(msg)
+                        self._reminded_events.add(str(event.id))
+                        c.execute("INSERT INTO event_reminders (event_id, reminded_at) VALUES (?, ?)", (str(event.id), now.isoformat()))
+                        conn.commit()
                 conn.close()
             except Exception as e:
                 print(f"Event reminder loop error: {e}")
@@ -779,15 +857,14 @@ class MyClient(discord.Client):
         now_jst = datetime.datetime.now(jst)
         if now_jst.hour == 8 and now_jst.minute == 0:
             today_str = now_jst.strftime("%Y-%m-%d")
+            if self.get_setting("ai_news_last_posted_date") == today_str:
+                return
             conn = db_connect()
             c = conn.cursor()
-            c.execute("SELECT 1 FROM settings WHERE key='ai_news_last_posted_date' AND value=?", (today_str,))
-            if c.fetchone() is not None:
-                conn.close()
-                return
             c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('ai_news_last_posted_date', ?)", (today_str,))
             conn.commit()
             conn.close()
+            self._settings_cache["ai_news_last_posted_date"] = today_str
             
             if not os.getenv("GEMINI_API_KEY"):
                 return
@@ -1829,6 +1906,7 @@ async def schedule_message(
     c.execute("INSERT INTO schedules (channel_id, send_at, message) VALUES (?, ?, ?)", (channel.id, send_at_str, final_msg))
     conn.commit()
     conn.close()
+    client.mark_schedules_dirty()
 
     mention_info = f"\n• メンション: `{mention_prefix}`" if mention_prefix else ""
     await interaction.response.send_message(
