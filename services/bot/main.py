@@ -139,6 +139,87 @@ def log_discord_message(message) -> None:
         print(f"Embed log failed: {e}")
     conn.close()
 
+def run_recovery_merge(old_url: str):
+    """旧NeonDBが読めるようになったら設定・予約・投稿・意味ベクトルを新DBへ統合する。戻り値=(完了bool, 要約str)。"""
+    import psycopg2
+    from psycopg2.extras import execute_values
+    try:
+        old = psycopg2.connect(old_url, connect_timeout=10)
+    except Exception:
+        return (False, "old DB still unreachable")
+    try:
+        o = old.cursor()
+        o.execute("SELECT 1")
+        o.execute("SELECT count(*) FROM discord_messages")
+        old_total = o.fetchone()[0]
+    except Exception as e:
+        old.close()
+        return (False, f"old DB error: {e}")
+
+    conn = db_connect()
+    c = conn.cursor()
+    # 既に完了印があるなら二度としない
+    c.execute("SELECT value FROM settings WHERE key='recovery_done'")
+    if c.fetchone():
+        conn.close()
+        old.close()
+        return (True, "already merged")
+
+    # --- settings（完了印以外を取り込む） ---
+    o.execute("SELECT key, value FROM settings")
+    old_settings = [r for r in o.fetchall() if r[0] != 'recovery_done']
+    for k, v in old_settings:
+        c.execute("INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (k, v,))
+    conn.commit()
+
+    # --- イベント発報済み（重複防止） ---
+    o.execute("SELECT event_id, reminded_at FROM event_reminders")
+    rem = o.fetchall()
+    if rem:
+        execute_values(c, "INSERT INTO event_reminders (event_id, reminded_at) VALUES %s ON CONFLICT (event_id) DO NOTHING", rem)
+        conn.commit()
+
+    # --- 予約送信（未来のものだけ。過去の遅延分は送らない） ---
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    now_str = datetime.datetime.now(jst).strftime("%Y-%m-%d %H:%M")
+    o.execute("SELECT id, channel_id, send_at, message FROM schedules WHERE send_at > %s", (now_str,))
+    sch = o.fetchall()
+    sch_n = 0
+    if sch:
+        execute_values(c, "INSERT INTO schedules (id, channel_id, send_at, message) VALUES %s ON CONFLICT (id) DO NOTHING",
+                       [(int(r[0]), int(r[1]), r[2], r[3]) for r in sch])
+        conn.commit()
+        sch_n = len(sch)
+
+    # --- 投稿＋意味ベクトル復元（欠けているmsg_idのみ追加・既存は温存） ---
+    o.execute("""SELECT msg_id, guild_name, place, place_id, is_thread, author, is_bot, ts, content, embedding
+                 FROM discord_messages ORDER BY msg_id""")
+    added = 0
+    vectors = 0
+    while True:
+        batch = o.fetchmany(500)
+        if not batch:
+            break
+        for r in batch:
+            if r[9] is None:
+                c.execute("INSERT INTO discord_messages (msg_id, guild_name, place, place_id, is_thread, author, is_bot, ts, content) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (msg_id) DO NOTHING",
+                          (r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]))
+            else:
+                c.execute("INSERT INTO discord_messages (msg_id, guild_name, place, place_id, is_thread, author, is_bot, ts, content, embedding) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector) ON CONFLICT (msg_id) DO NOTHING",
+                          (r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], str(r[9])))
+                vectors += 1
+            if c.rowcount and c.rowcount > 0:
+                added += 1
+        conn.commit()
+    conn.autocommit = True
+
+    c.execute("INSERT INTO settings (key, value) VALUES ('recovery_done', %s)", (datetime.datetime.now(jst).isoformat(),))
+    conn.commit()
+    conn.close()
+    old.close()
+    summary = f"settings={len(old_settings)} reminders={len(rem)} schedules={sch_n} old_msgs={old_total} added={added} vectors={vectors}"
+    return (True, summary)
+
 def embed_backfill_once(max_rows: int = 150):
     """未埋め込みの投稿をまとめて意味化する。戻り値=(処理数, 残り数)。429時は休憩込みで自動継続。"""
     conn = db_connect()
@@ -707,6 +788,21 @@ class MyClient(discord.Client):
         except Exception as e:
             print(f"Embed backfill error: {e}")
 
+    @tasks.loop(hours=1)
+    async def recovery_loop(self):
+        """旧NeonDBの月枠回復を待って、設定・予約・投稿・意味ベクトルを自動統合する（一度成功したら停止）。"""
+        old_url = os.getenv("RECOVERY_DATABASE_URL", "")
+        if not old_url:
+            return
+        try:
+            done, summary = await asyncio.to_thread(run_recovery_merge, old_url)
+            if done or "error" not in summary:
+                print(f"Recovery check: {summary}")
+            if done:
+                self.recovery_loop.stop()
+        except Exception as e:
+            print(f"Recovery check failed: {e}")
+
     @tasks.loop(minutes=1)
     async def schedule_loop(self):
         jst = datetime.timezone(datetime.timedelta(hours=9))
@@ -907,6 +1003,8 @@ class MyClient(discord.Client):
         self.add_view(MentorAcceptView())
         self.add_view(RuleVerifyView())
         self.deadline_loop.start()
+        if os.getenv("RECOVERY_DATABASE_URL", "") and USE_POSTGRES:
+            self.recovery_loop.start()
         self.schedule_loop.start()
         self.event_reminder_loop.start()
         self.ai_news_loop.start()
