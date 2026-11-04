@@ -1,0 +1,21 @@
+name: Keep Bot Awake
+
+# Render無料プランは15分アクセスがないとスピンダウン（Botがオフライン）になるため、
+# 8分ごとにヘルスチェックURLへアクセスして常時起動を維持する。
+# 無料利用枠内: 1実行あたり数秒、月間約720分（上限2000分）。
+
+on:
+  schedule:
+    - cron: "*/8 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping bot health endpoint
+        run: |
+          code=$(curl -fsS -m 25 https://hackathonbot-2.onrender.com/ -o /dev/null -w "%{http_code}" || echo "000")
+          echo "health status: $code"
