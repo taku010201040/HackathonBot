@@ -276,6 +276,46 @@ def get_server_structure_context(guild: discord.Guild = None) -> str:
             
     return "\n".join(lines)
 
+# --- Gemini生成の多段フォールバック ---
+# 新flash系モデルは無料枠が「1日20リクエスト/モデル」のため、上限到達で429になったら
+# 異なるモデルIDへ切り替えて日次リクエスト枠を稼ぐ（リセット日内で有効）。
+_GEN_EXHAUSTED = {"date": "", "models": set()}
+
+def _gen_model_candidates():
+    today = datetime.date.today().isoformat()
+    if _GEN_EXHAUSTED["date"] != today:
+        _GEN_EXHAUSTED["date"] = today
+        _GEN_EXHAUSTED["models"] = set()
+    base = GEMINI_MODEL or 'gemini-flash-latest'
+    ordered = []
+    for m in [base, 'gemini-flash-lite-latest', 'gemini-3.5-flash', 'gemini-2.5-flash', 'gemini-2.5-flash-lite']:
+        if m and m not in _GEN_EXHAUSTED["models"]:
+            ordered.append(m)
+    if not ordered:
+        _GEN_EXHAUSTED["models"] = set()
+        ordered = [base]
+    return ordered
+
+def generate_with_fallback(prompt, system_instruction=None):
+    """別モデルへの切替を試みる。日次上限429は候補を消費して次へ。"""
+    last_err = None
+    for name in _gen_model_candidates():
+        try:
+            if system_instruction is not None:
+                model = genai.GenerativeModel(name, system_instruction=system_instruction, generation_config=generation_config)
+            else:
+                model = genai.GenerativeModel(name, generation_config=generation_config)
+            response = model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            last_err = e
+            es = str(e)
+            if "429" in es and "GenerateRequestsPerDay" in es:
+                _GEN_EXHAUSTED["models"].add(name)
+                continue
+            raise
+    raise last_err if last_err else RuntimeError("No available Gemini model")
+
 async def ask_gemini(prompt: str, guild: discord.Guild = None) -> str:
     if not os.getenv("GEMINI_API_KEY"):
         return "Gemini APIキーが設定されていません。"
@@ -289,10 +329,16 @@ async def ask_gemini(prompt: str, guild: discord.Guild = None) -> str:
         full_context += f"\n\n【過去のDiscordのやり取り（参考）】\n{excerpts}"
     system_instruction = f"あなたはハッカソンのサポートAIです。以下のナレッジおよびサーバー情報を参考にして回答してください。\n【情報】\n{full_context}"
     try:
-        model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=system_instruction, generation_config=generation_config)
-        response = model.generate_content(prompt)
-        return response.text
+        answer = generate_with_fallback(prompt, system_instruction=system_instruction)
+        return answer
     except Exception as e:
+        es = str(e)
+        if "429" in es and "GenerateRequestsPerDay" in es:
+            m = re.search(r"Please retry in\s*(\S+)", es)
+            wait = ""
+            if m:
+                wait = f"\n復旧予定: 約 `{m.group(1)}` 後"
+            return f"⚠️ 今日のAI利用枠（無料）を使い切りました。枠回復後にまた呼び出してください。{wait}"
         return f"AIエラー: {e}"
 
 
@@ -973,9 +1019,7 @@ class MyClient(discord.Client):
                 "・日本語で丁寧かつ読みやすいレイアウトで作成してください。"
             )
             try:
-                model = genai.GenerativeModel(GEMINI_MODEL, generation_config=generation_config)
-                response = model.generate_content(news_prompt)
-                news_content = response.text
+                news_content = generate_with_fallback(news_prompt)
                 
                 target_gids = get_guild_ids()
                 guilds = [self.get_guild(gid) for gid in target_gids if self.get_guild(gid)] if target_gids else self.guilds
