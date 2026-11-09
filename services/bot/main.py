@@ -14,6 +14,9 @@ from discord.ext import tasks
 import google.generativeai as genai
 import asyncio
 import re
+import urllib.request
+import urllib.parse
+import xml.etree.ElementTree as ET
 from typing import Optional
 
 load_dotenv()
@@ -315,6 +318,32 @@ def generate_with_fallback(prompt, system_instruction=None):
                 continue
             raise
     raise last_err if last_err else RuntimeError("No available Gemini model")
+
+# --- 毎朝のAIニュース: Google News RSS連携 ---
+# Geminiの学習データに頼ると数ヶ月前の話題が混じるため、キー不要のGoogle News RSSから
+# 直近48時間のAI関連見出しを取得し、その事実ベースでGeminiに要約させる。
+def fetch_latest_ai_news(limit: int = 24):
+    """Google News RSSから直近48時間のAI関連見出しを取得する。戻り値=[(title, link, source), ...]、失敗時は空リスト。"""
+    query = "AI OR 生成AI OR LLM OR ChatGPT when:2d"
+    url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}&hl=ja&gl=JP&ceid=JP:ja"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (HackathonBot; +https://github.com/taku010201040/HackathonBot)"})
+    items = []
+    try:
+        with urllib.request.urlopen(req, timeout=25) as res:
+            root = ET.fromstring(res.read())
+        for el in root.iter("item"):
+            title = (el.findtext("title") or "").strip()
+            link = (el.findtext("link") or "").strip()
+            src_el = el.find("source")
+            source = (src_el.text or "").strip() if src_el is not None else ""
+            if title and link:
+                items.append((title, link, source))
+            if len(items) >= limit:
+                break
+    except Exception as e:
+        print(f"Google News RSS fetch error: {e}")
+        return []
+    return items
 
 async def ask_gemini(prompt: str, guild: discord.Guild = None) -> str:
     if not os.getenv("GEMINI_API_KEY"):
@@ -1011,13 +1040,29 @@ class MyClient(discord.Client):
             if not os.getenv("GEMINI_API_KEY"):
                 return
 
-            news_prompt = (
-                "最新の注目のAI技術トレンド、LLM、生成AIツール、オープンソースモデル、AI業界の話題など、"
-                "エンジニアやハッカソン参加者がワクワクするようなAIニュースを3〜5つ厳選して要約してください。\n"
-                "構成条件:\n"
-                "・各ニュースに絵文字タイトル、概要、注目ポイントを分かりやすくまとめてください。\n"
-                "・日本語で丁寧かつ読みやすいレイアウトで作成してください。"
-            )
+            # RSSから直近48時間の見出しを取り、その事実ベースで要約させる。
+            # （旧: Geminiの学習知識だけで生成 → 数ヶ月前の話題が混じる問題の解消）
+            # RSSが取れないときは従来どおりGeminiの知識で生成してフォールバック。
+            news_items = await asyncio.to_thread(fetch_latest_ai_news)
+            if news_items:
+                headlines = "\n".join(f"{i + 1}. {t}" for i, (t, _l, _s) in enumerate(news_items))
+                news_prompt = (
+                    "以下はGoogle News RSSから取得した直近48時間のAI関連の最新見出しです。\n"
+                    "エンジニアやハッカソン参加者がワクワクするニュースを3〜5つ選び、要約してください。\n"
+                    "構成条件:\n"
+                    "・各ニュースに絵文字タイトル、概要、注目ポイントを分かりやすくまとめてください。\n"
+                    "・見出しに書かれていない事実は作り込まないでください。\n"
+                    "・日本語で丁寧かつ読みやすいレイアウトで作成してください。\n\n"
+                    f"【最新見出し一覧】\n{headlines}"
+                )
+            else:
+                news_prompt = (
+                    "最新の注目のAI技術トレンド、LLM、生成AIツール、オープンソースモデル、AI業界の話題など、"
+                    "エンジニアやハッカソン参加者がワクワクするようなAIニュースを3〜5つ厳選して要約してください。\n"
+                    "構成条件:\n"
+                    "・各ニュースに絵文字タイトル、概要、注目ポイントを分かりやすくまとめてください。\n"
+                    "・日本語で丁寧かつ読みやすいレイアウトで作成してください。"
+                )
             try:
                 news_content = generate_with_fallback(news_prompt)
                 
@@ -1030,12 +1075,26 @@ class MyClient(discord.Client):
                     if not news_ch:
                         news_ch = discord.utils.find(lambda c: "テックニュース" in c.name or "aiニュース" in c.name, guild.text_channels)
                     if news_ch:
+                        # 出典リンクを本文に追記（要約の根拠記事を開けるように）
+                        desc = news_content
+                        if news_items:
+                            seen, src_lines = set(), []
+                            for _t, link, source in news_items:
+                                label = source or "Google News"
+                                if label in seen:
+                                    continue
+                                seen.add(label)
+                                src_lines.append(f"[{len(src_lines) + 1}] [{label}]({link})")
+                                if len(src_lines) >= 8:
+                                    break
+                            if src_lines:
+                                desc += "\n\n**出典**\n" + "\n".join(src_lines)
                         embed = discord.Embed(
                             title=f"📰 【毎朝のAIニュースダイジェスト】 {now_jst.strftime('%Y年%m月%d日')}",
-                            description=news_content,
+                            description=desc[:4000],
                             color=0x448AFF
                         )
-                        embed.set_footer(text="🤖 Powered by Gemini AI | 毎朝8時配信")
+                        embed.set_footer(text="🤖 Gemini AI × Google News | 毎朝8時配信")
                         await news_ch.send(embed=embed, silent=True)
             except Exception as e:
                 print(f"AI news loop error: {e}")
