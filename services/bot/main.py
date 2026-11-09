@@ -1693,7 +1693,14 @@ async def _cleanup_old_sticky(channel: discord.TextChannel):
     except Exception:
         pass
 
+STICKY_INITIALIZED = False
+
 async def initialize_sticky_messages():
+    # 一度貼ったら、同一プロセス内の再接続(on_ready再発)では再送しない。
+    # インスタンス再起動時はメモリが空なので再度貼られる（古いものは削除してから）。
+    global STICKY_INITIALIZED
+    if STICKY_INITIALIZED:
+        return
     for guild in client.guilds:
         for channel in guild.text_channels:
             template_text = _match_template(channel.name)
@@ -1704,6 +1711,7 @@ async def initialize_sticky_messages():
                     sticky_messages[channel.id] = new_msg.id
                 except Exception as e:
                     print(f"Error initializing sticky for {channel.name}: {e}")
+    STICKY_INITIALIZED = True
 
 
 @client.event
