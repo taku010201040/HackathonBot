@@ -36,7 +36,7 @@ def _translate_sql(sql):
     if m:
         table, cols_raw, vals_raw = m.group(1), m.group(2), m.group(3)
         cols = [c.strip() for c in cols_raw.split(",")]
-        pk = {"settings": "key", "users": "user_id"}.get(table)
+        pk = {"settings": "key", "users": "user_id", "sticky_messages": "channel_id"}.get(table)
         if pk:
             rest = [c for c in cols if c != pk]
             sets = ", ".join(f"{c} = EXCLUDED.{c}" for c in rest)
@@ -1809,6 +1809,27 @@ async def initialize_sticky_messages():
                             continue
                         except Exception:
                             pass  # 保存済みメッセージが消されている→再作成へ
+                    # DB未登録の場合は、直近50件から既存のBot stickyを探して引継ぐ
+                    # （再起動・再接続時に一切投稿しない=重複通知ゼロ）
+                    existing_id = None
+                    try:
+                        async for m in channel.history(limit=50):
+                            if m.author == client.user and STICKY_PREFIX in (m.content or ""):
+                                existing_id = m.id  # historyは新しい順
+                                break
+                    except Exception:
+                        existing_id = None
+                    if existing_id:
+                        sticky_messages[channel.id] = existing_id
+                        await asyncio.to_thread(_sticky_db_save, channel.id, existing_id)
+                        # 引継ぎ以外の重複stickyがあれば掃除
+                        try:
+                            async for m in channel.history(limit=50):
+                                if m.author == client.user and STICKY_PREFIX in (m.content or "") and m.id != existing_id:
+                                    await m.delete()
+                        except Exception:
+                            pass
+                        continue
                     await _cleanup_old_sticky(channel)
                     new_msg = await channel.send(f"{STICKY_PREFIX}\n\n{template_text}", silent=True)
                     sticky_messages[channel.id] = new_msg.id
