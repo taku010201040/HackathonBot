@@ -73,6 +73,7 @@ def init_db():
     c.execute('CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id INTEGER, send_at TEXT, message TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS event_reminders (event_id TEXT PRIMARY KEY, reminded_at TEXT)')
+    c.execute('CREATE TABLE IF NOT EXISTS sticky_messages (channel_id TEXT PRIMARY KEY, message_id TEXT)')
     conn.commit()
     conn.close()
 init_db()
@@ -1759,9 +1760,33 @@ async def _cleanup_old_sticky(channel: discord.TextChannel):
 STICKY_INITIALIZED = False
 _STICKY_LOCK = asyncio.Lock()
 
+def _sticky_db_load_all() -> dict:
+    """全stickyの保存状態を一括取得（起動1回だけの同期呼び出し用）。"""
+    try:
+        conn = db_connect()
+        c = conn.cursor()
+        c.execute('SELECT channel_id, message_id FROM sticky_messages')
+        rows = c.fetchall()
+        conn.close()
+        return {int(cid): int(mid) for cid, mid in rows if cid and mid}
+    except Exception:
+        return {}
+
+def _sticky_db_save(channel_id, message_id):
+    try:
+        conn = db_connect()
+        c = conn.cursor()
+        c.execute('INSERT OR REPLACE INTO sticky_messages (channel_id, message_id) VALUES (?, ?)',
+                  (str(channel_id), str(message_id)))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
 async def initialize_sticky_messages():
-    # 一度貼ったら、同一プロセス内の再接続(on_ready再発)では再送しない。
-    # インスタンス再起動時はメモリが空なので再度貼られる（古いものは削除してから）。
+    # 起動時のsticky処理。DBに保存済みのメッセージIDが生きている場合はそれを引継ぎ、
+    # 再起動・再接続時に「削除→再貼り」を一切行わない（重複通知の完全防止）。
+    # 生存しない（削除された）場合のみ、清掃して1回だけ新規投稿する。
     # フラグはawaitより前に立てる（送信中にREADYが再発火したときの同時投稿レース防止）。
     global STICKY_INITIALIZED
     if STICKY_INITIALIZED:
@@ -1770,16 +1795,26 @@ async def initialize_sticky_messages():
         if STICKY_INITIALIZED:
             return
         STICKY_INITIALIZED = True
+        saved_map = await asyncio.to_thread(_sticky_db_load_all)
         for guild in client.guilds:
             for channel in guild.text_channels:
                 template_text = _match_template(channel.name)
-                if template_text:
-                    try:
-                        await _cleanup_old_sticky(channel)
-                        new_msg = await channel.send(f"{STICKY_PREFIX}\n\n{template_text}", silent=True)
-                        sticky_messages[channel.id] = new_msg.id
-                    except Exception as e:
-                        print(f"Error initializing sticky for {channel.name}: {e}")
+                if not template_text:
+                    continue
+                try:
+                    if channel.id in saved_map:
+                        try:
+                            await channel.fetch_message(saved_map[channel.id])
+                            sticky_messages[channel.id] = saved_map[channel.id]
+                            continue
+                        except Exception:
+                            pass  # 保存済みメッセージが消されている→再作成へ
+                    await _cleanup_old_sticky(channel)
+                    new_msg = await channel.send(f"{STICKY_PREFIX}\n\n{template_text}", silent=True)
+                    sticky_messages[channel.id] = new_msg.id
+                    await asyncio.to_thread(_sticky_db_save, channel.id, new_msg.id)
+                except Exception as e:
+                    print(f"Error initializing sticky for {channel.name}: {e}")
 
 
 @client.event
@@ -1915,6 +1950,8 @@ async def on_message(message: discord.Message):
     try:
         new_msg = await message.channel.send(f"{STICKY_PREFIX}\n\n{template_text}", silent=True)
         sticky_messages[message.channel.id] = new_msg.id
+        # 再起動時に再投稿しないよう、新しいIDを永続化（バックグラウンドで書き込み）
+        asyncio.create_task(asyncio.to_thread(_sticky_db_save, message.channel.id, new_msg.id))
     except Exception as e:
         print(f"Error sending sticky message: {e}")
 
