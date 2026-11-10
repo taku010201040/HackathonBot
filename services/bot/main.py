@@ -358,7 +358,10 @@ async def ask_gemini(prompt: str, guild: discord.Guild = None) -> str:
         full_context += f"\n\n【過去のDiscordのやり取り（参考）】\n{excerpts}"
     system_instruction = f"あなたはハッカソンのサポートAIです。以下のナレッジおよびサーバー情報を参考にして回答してください。\n【情報】\n{full_context}"
     try:
-        answer = generate_with_fallback(prompt, system_instruction=system_instruction)
+        # Gemini生成(5〜30秒)は同期ブロッキング呼び出しなので必ずワーカースレッドへ。
+        # そのまま実行するとイベントループが止まり、Discordのheartbeatが途切れて
+        # 「一瞬切れて再接続」が起きる（11/7〜11/10の毎朝8時03分のセッション無効化と一致）。
+        answer = await asyncio.to_thread(generate_with_fallback, prompt, system_instruction)
         return answer
     except Exception as e:
         es = str(e)
@@ -1064,7 +1067,8 @@ class MyClient(discord.Client):
                     "・日本語で丁寧かつ読みやすいレイアウトで作成してください。"
                 )
             try:
-                news_content = generate_with_fallback(news_prompt)
+                # 生成をワーカースレッドで実行（8時のループ凍結→セッション無効化を防止）
+                news_content = await asyncio.to_thread(generate_with_fallback, news_prompt)
                 
                 target_gids = get_guild_ids()
                 guilds = [self.get_guild(gid) for gid in target_gids if self.get_guild(gid)] if target_gids else self.guilds
@@ -1753,24 +1757,29 @@ async def _cleanup_old_sticky(channel: discord.TextChannel):
         pass
 
 STICKY_INITIALIZED = False
+_STICKY_LOCK = asyncio.Lock()
 
 async def initialize_sticky_messages():
     # 一度貼ったら、同一プロセス内の再接続(on_ready再発)では再送しない。
     # インスタンス再起動時はメモリが空なので再度貼られる（古いものは削除してから）。
+    # フラグはawaitより前に立てる（送信中にREADYが再発火したときの同時投稿レース防止）。
     global STICKY_INITIALIZED
     if STICKY_INITIALIZED:
         return
-    for guild in client.guilds:
-        for channel in guild.text_channels:
-            template_text = _match_template(channel.name)
-            if template_text:
-                try:
-                    await _cleanup_old_sticky(channel)
-                    new_msg = await channel.send(f"{STICKY_PREFIX}\n\n{template_text}", silent=True)
-                    sticky_messages[channel.id] = new_msg.id
-                except Exception as e:
-                    print(f"Error initializing sticky for {channel.name}: {e}")
-    STICKY_INITIALIZED = True
+    async with _STICKY_LOCK:
+        if STICKY_INITIALIZED:
+            return
+        STICKY_INITIALIZED = True
+        for guild in client.guilds:
+            for channel in guild.text_channels:
+                template_text = _match_template(channel.name)
+                if template_text:
+                    try:
+                        await _cleanup_old_sticky(channel)
+                        new_msg = await channel.send(f"{STICKY_PREFIX}\n\n{template_text}", silent=True)
+                        sticky_messages[channel.id] = new_msg.id
+                    except Exception as e:
+                        print(f"Error initializing sticky for {channel.name}: {e}")
 
 
 @client.event
@@ -1857,19 +1866,21 @@ async def on_message(message: discord.Message):
     ch_name = getattr(message.channel, 'name', '').lower()
     if "コミュニティ・アップデート" in ch_name or "community-updates" in ch_name or "コミュニティアップデート" in ch_name:
         # 英語のメッセージが来たら翻訳する (botでもwebhookでもユーザーでも翻訳)
-        content_text = message.content or ""
-        # Embedがある場合はEmbedの説明文も対象にする
-        for emb in message.embeds:
-            if emb.description:
-                content_text += "\n" + emb.description
-                
-        if content_text.strip():
-            try:
-                translated = GoogleTranslator(source='auto', target='ja').translate(content_text)
-                if translated:
-                    await message.reply(f"🇯🇵 **自動翻訳:**\n{translated}", silent=True)
-            except Exception as e:
-                print(f"Translation failed: {e}")
+        # ただし自分自身の翻訳返信は対象外（再翻訳→返信→再翻訳の無限ループ防止）
+        if message.author != client.user:
+            content_text = message.content or ""
+            # Embedがある場合はEmbedの説明文も対象にする
+            for emb in message.embeds:
+                if emb.description:
+                    content_text += "\n" + emb.description
+
+            if content_text.strip():
+                try:
+                    translated = GoogleTranslator(source='auto', target='ja').translate(content_text)
+                    if translated:
+                        await message.reply(f"🇯🇵 **自動翻訳:**\n{translated}", silent=True)
+                except Exception as e:
+                    print(f"Translation failed: {e}")
 
     if message.author.bot:
         return
@@ -2324,9 +2335,74 @@ async def list_schedules(interaction: discord.Interaction):
         await interaction.followup.send(content=msg_content, embed=embed, ephemeral=True, silent=True)
 
 
+class _HealthHandler(SimpleHTTPRequestHandler):
+    """ヘルスチェック専用ハンドラ。ルート以外のファイル一覧・ソース露出を防ぎ、
+    /debug/messages でBotから見えたDiscord実状態（直近メッセージ）を確認できる。"""
+
+    def _reply(self, code: int, body: bytes, ctype: str = "text/plain; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def do_GET(self):
+        try:
+            if self.path == "/" or self.path.startswith("/health"):
+                self._reply(200, b"OK")
+                return
+            if self.path.startswith("/debug/messages"):
+                self._serve_debug_messages()
+                return
+            self._reply(404, b"not found")
+        except Exception as e:
+            self._reply(500, f"health handler error: {e}".encode("utf-8", "replace"))
+
+    def _serve_debug_messages(self):
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        match = (q.get("q", [""])[0] or "").lower()
+        try:
+            limit = max(2, min(int(q.get("n", ["12"])[0]), 20))
+        except Exception:
+            limit = 12
+
+        async def collect():
+            lines = []
+            for g in client.guilds:
+                for ch in g.text_channels:
+                    if match and match not in ch.name.lower():
+                        continue
+                    try:
+                        msgs = [m async for m in ch.history(limit=limit)]
+                    except Exception as e:
+                        lines.append(f"== #{ch.name}: ERROR {type(e).__name__}")
+                        continue
+                    if not msgs:
+                        continue
+                    lines.append(f"== {g.name} >> #{ch.name} (id={ch.id})")
+                    for m in reversed(msgs):
+                        content = (m.content or "")[:110].replace("\n", " / ")
+                        tag = "[BOT]" if m.author.bot else (getattr(m.author, "display_name", None) or m.author.name)
+                        ext = ""
+                        for e2 in m.embeds:
+                            ext += " |EMB:" + (e2.title or "")[:40]
+                        lines.append(f"{m.created_at.strftime('%m-%d %H:%M:%S')} {tag}{ext} {content}")
+            return "\n".join(lines) or "no channel matched"
+
+        try:
+            # ヘルスサーバーは別スレッドで動くため、Discord操作はイベントループへ投げる
+            fut = asyncio.run_coroutine_threadsafe(collect(), client.loop)
+            body = fut.result(timeout=25).encode("utf-8", "replace")
+        except Exception as e:
+            body = f"debug error: {e}".encode("utf-8", "replace")
+        self._reply(200, body)
+
 def run_health_check_server():
     port = int(os.getenv("PORT", "8080"))
-    server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
+    server = HTTPServer(('0.0.0.0', port), _HealthHandler)
     print(f"Health check server running on port {port}...")
     server.serve_forever()
 
