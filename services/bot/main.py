@@ -1028,6 +1028,10 @@ class MyClient(discord.Client):
 
     @tasks.loop(minutes=1)
     async def ai_news_loop(self):
+        # 配信ON/OFFスイッチ: 環境変数 AI_NEWS_ENABLED=0 で毎朝のニュース配信を停止できる
+        # （Render側のenv変更だけで切替可能。デフォルトは配信ON）
+        if os.getenv("AI_NEWS_ENABLED", "1").strip() != "1":
+            return
         jst = datetime.timezone(datetime.timedelta(hours=9))
         now_jst = datetime.datetime.now(jst)
         if now_jst.hour == 8 and now_jst.minute == 0:
